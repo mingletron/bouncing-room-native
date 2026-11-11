@@ -17,9 +17,12 @@
 //! Spin only ever comes from the tangential part of an impulse: a radial impulse
 //! runs along the centre line, so it has no moment arm.
 
-use glam::{Mat4, Vec3};
+use std::sync::Arc;
+
+use glam::{Mat3, Mat4, Vec3};
 
 use crate::geom::PRIMITIVE_NAMES;
+use crate::hull::{Contact, Hull, Placed};
 
 /// Ceiling on angular speed (rad/s); contacts clamp toward it after any change.
 pub const MAX_SPIN: f32 = 9.0;
@@ -57,6 +60,26 @@ pub const ROOM_HALF_Z: f32 = 7.2;
 /// [`SUBSTEP_TARGET`] seconds.
 pub const MAX_SUBSTEPS: usize = 4;
 pub const SUBSTEP_TARGET: f64 = 1.0 / 120.0;
+
+/// Up to this many bodies, every pair is tested against every other, in the
+/// order the JS oracle tests them — so a room the size the browser build could
+/// show behaves exactly as it always has. Past it the pair loop goes through a
+/// spatial grid instead, which is what makes thousands of bodies affordable.
+pub const BRUTE_FORCE_MAX: usize = 64;
+
+/// How hard a held body is pulled to the pointer: its velocity is this many
+/// times its distance from where the pointer wants it, per second.
+pub const HOLD_STIFFNESS: f32 = 14.0;
+/// Fastest a held body is allowed to chase the pointer, so a flick across the
+/// window is a throw rather than a tunnel through the wall.
+pub const HOLD_MAX_SPEED: f32 = 34.0;
+
+/// Friction for hull contacts is a Coulomb limit rather than the fraction of
+/// slip the sphere contacts remove; this turns one dial into the other.
+const HULL_FRICTION_SCALE: f32 = 3.5;
+/// Spin a hull keeps per contact. A sphere can roll forever; a faceted body
+/// rocking on an edge has to lose that energy somewhere or it never lies down.
+const HULL_CONTACT_SPIN_KEEP: f32 = 0.985;
 
 /// Impact rings older than this many entries get dropped.
 pub const MAX_IMPACTS: usize = 48;
@@ -157,6 +180,29 @@ impl Rng {
     }
 }
 
+/// Everything a run needs to be put back exactly where it was: the bodies, the
+/// rings in flight, and the generator's position in its stream. The tuning is
+/// deliberately not here — rewinding the room should not undo a slider.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    bodies: Vec<Body>,
+    impacts: Vec<Impact>,
+    rng: Rng,
+}
+
+impl Snapshot {
+    /// Roughly what holding this costs, for a history that budgets by memory.
+    pub fn bytes(&self) -> usize {
+        self.bodies.len() * std::mem::size_of::<Body>()
+            + self.impacts.len() * std::mem::size_of::<Impact>()
+            + std::mem::size_of::<Self>()
+    }
+
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+}
+
 /// The contact parameters, copied out so `bodies` and `impacts` can be borrowed
 /// at the same time.
 #[derive(Copy, Clone, Debug)]
@@ -188,6 +234,12 @@ pub struct World {
     /// `primitive`; the contract's `Body` carries only a shape index, so the
     /// palette lives on the world.
     pub colors: Vec<[f32; 3]>,
+    /// Convex-hull colliders, indexed by `Body::shape` like `colors`. A shape
+    /// with no entry (or `None`) collides as its bounding sphere, which is every
+    /// shape unless the caller registers a hull for it.
+    pub colliders: Vec<Option<Arc<Hull>>>,
+    /// Master switch for `colliders`: off, every body is a sphere again.
+    pub hulls: bool,
 
     rng: Rng,
 }
@@ -214,6 +266,8 @@ impl World {
             pair_friction: PAIR_FRICTION,
             spin_coupling: SPIN_COUPLING,
             colors: crate::geom::PRIMITIVE_COLORS.to_vec(),
+            colliders: Vec::new(),
+            hulls: true,
             rng: Rng(0x5EED_1234_ABCD_EF00),
         }
     }
@@ -229,6 +283,65 @@ impl World {
 
     pub fn body_mut(&mut self, index: usize) -> Option<&mut Body> {
         self.bodies.get_mut(index)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            bodies: self.bodies.clone(),
+            impacts: self.impacts.clone(),
+            rng: self.rng,
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: &Snapshot) {
+        self.bodies.clone_from(&snapshot.bodies);
+        self.impacts.clone_from(&snapshot.impacts);
+        self.rng = snapshot.rng;
+    }
+
+    /// The first body a ray hits, and how far along the ray. `dir` must be unit
+    /// length. Bodies are tested as spheres the size they are *drawn*, not the
+    /// size they collide at, because what is being picked is the picture.
+    pub fn pick(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, b) in self.bodies.iter().enumerate() {
+            let radius = b.scale.max(b.radius) * 0.95;
+            let to = b.pos - origin;
+            let along = to.dot(dir);
+            let off2 = to.length_squared() - along * along;
+            if off2 > radius * radius {
+                continue;
+            }
+            let t = along - (radius * radius - off2).sqrt();
+            if t > 0.0 && best.is_none_or(|(_, bt)| t < bt) {
+                best = Some((i, t));
+            }
+        }
+        best
+    }
+
+    /// Pull a held body toward `target`: its velocity becomes whatever closes
+    /// the gap, capped. Nothing is done on release — the body simply keeps the
+    /// velocity it was last given, which is what makes letting go a throw.
+    pub fn hold(&mut self, index: usize, target: Vec3) {
+        let (hx, hy, hz) = (self.half_x, self.half_y, self.half_z);
+        let Some(b) = self.bodies.get_mut(index) else {
+            return;
+        };
+        let r = b.radius;
+        let target = Vec3::new(
+            clamp_f(target.x, -hx + r, hx - r),
+            clamp_f(target.y, r, hy - r),
+            clamp_f(target.z, -hz + r, hz - r),
+        );
+        let mut vel = (target - b.pos) * HOLD_STIFFNESS;
+        let speed = vel.length();
+        if speed > HOLD_MAX_SPEED {
+            vel *= HOLD_MAX_SPEED / speed;
+        }
+        b.vel = vel;
+        // A held thing should not also be spinning itself out of the hand.
+        b.ang_vel *= 0.9;
     }
 
     /// Random-ish spawn; returns the new body's index.
@@ -289,6 +402,10 @@ impl World {
     /// Separate any overlapping pair so a respawn or a drag never leaves bodies
     /// interpenetrating.
     pub fn settle(&mut self) {
+        if self.bodies.len() > BRUTE_FORCE_MAX {
+            self.settle_with_grid();
+            return;
+        }
         for _pass in 0..24 {
             let mut worst = 0.0f32;
             let n = self.bodies.len();
@@ -322,6 +439,45 @@ impl World {
                     left[i].pos -= (nvec / l) * push;
                     b.pos += (nvec / l) * push;
                 }
+            }
+            self.clamp_to_room();
+            if worst < 1e-3 {
+                break;
+            }
+        }
+    }
+
+    /// [`World::settle`] for a crowd: the same push-apart rule, with the pairs
+    /// found through the grid instead of by testing every body against every
+    /// other, 24 times over.
+    fn settle_with_grid(&mut self) {
+        for _pass in 0..24 {
+            let mut worst = 0.0f32;
+            let pairs = grid_pairs(&self.bodies, &|b: &Body| b.radius, self.half_x, self.half_y, self.half_z);
+            for (i, j) in pairs {
+                let (left, right) = self.bodies.split_at_mut(j as usize);
+                let (a, b) = (&mut left[i as usize], &mut right[0]);
+                let d = b.pos - a.pos;
+                let sum = a.radius + b.radius;
+                let dist = d.length();
+                if dist >= sum {
+                    continue;
+                }
+                let overlap = sum - dist;
+                worst = worst.max(overlap);
+                let nvec = if dist > 1e-6 {
+                    d / dist
+                } else {
+                    Vec3::new(
+                        self.rng.range(-1.0, 1.0),
+                        self.rng.range(-1.0, 1.0),
+                        self.rng.range(-1.0, 1.0),
+                    )
+                    .normalize_or(Vec3::Y)
+                };
+                let push = overlap * 0.5 + 0.01;
+                a.pos -= nvec * push;
+                b.pos += nvec * push;
             }
             self.clamp_to_room();
             if worst < 1e-3 {
@@ -370,15 +526,19 @@ impl World {
         let (hx, hy, hz) = (self.half_x, self.half_y, self.half_z);
         let collide = self.collide;
 
+        let hulls = self.hulls;
+
         // Destructure so `bodies`, `impacts`, `colors` and `rng` can all be
         // borrowed independently inside the loops below.
         let World {
             bodies,
             impacts,
             colors,
+            colliders,
             rng,
             ..
         } = self;
+        let colliders = colliders.as_slice();
 
         for b in bodies.iter_mut() {
             b.vel.y += g * h;
@@ -392,38 +552,44 @@ impl World {
 
         let palette = colors.as_slice();
         for b in bodies.iter_mut() {
-            collide_with_walls(b, t, hx, hy, hz, palette, impacts);
+            match hull_in(hulls, colliders, b.shape) {
+                Some(hull) => collide_hull_with_walls(b, hull, t, hx, hy, hz, palette, impacts),
+                None => collide_with_walls(b, t, hx, hy, hz, palette, impacts),
+            }
         }
 
         if collide {
             let n = bodies.len();
-            for i in 0..n {
-                let (left, right) = bodies.split_at_mut(i + 1);
-                // Copy `a` out so the rest of the slice stays free to mutate.
-                // Nothing else touches bodies[i] while this inner loop runs, so
-                // carrying the running updates in the local matches the JS live
-                // reference (unlike `settle`, where each pass re-reads it).
-                let mut a = left[i];
-                for b in right.iter_mut() {
-                    let d = b.pos - a.pos;
-                    let sum = a.radius + b.radius;
-                    if d.length_squared() >= sum * sum {
-                        continue;
+            if n <= BRUTE_FORCE_MAX {
+                for i in 0..n {
+                    let (left, right) = bodies.split_at_mut(i + 1);
+                    // Copy `a` out so the rest of the slice stays free to mutate.
+                    // Nothing else touches bodies[i] while this inner loop runs, so
+                    // carrying the running updates in the local matches the JS live
+                    // reference (unlike `settle`, where each pass re-reads it).
+                    let mut a = left[i];
+                    for b in right.iter_mut() {
+                        resolve_pair(&mut a, b, t, palette, hulls, colliders, rng, impacts);
                     }
-                    if d.length() < 1e-6 {
-                        // Perfectly concentric pair: pick any direction to split them.
-                        b.pos += Vec3::new(
-                            rng.range(-0.02, 0.02),
-                            0.03,
-                            rng.range(-0.02, 0.02),
-                        );
-                        continue;
-                    }
-                    if let Some(impact) = collide_pair(&mut a, b, t, palette) {
-                        impacts.push(impact);
-                    }
+                    left[i] = a;
                 }
-                left[i] = a;
+            } else {
+                // The same contacts, in the same order (ascending i, then j), but
+                // only for pairs the grid says are near each other.
+                let bound = |b: &Body| bound_radius(b, hulls, colliders);
+                for (i, j) in grid_pairs(bodies, &bound, hx, hy, hz) {
+                    let (left, right) = bodies.split_at_mut(j as usize);
+                    resolve_pair(
+                        &mut left[i as usize],
+                        &mut right[0],
+                        t,
+                        palette,
+                        hulls,
+                        colliders,
+                        rng,
+                        impacts,
+                    );
+                }
             }
         }
     }
@@ -444,6 +610,164 @@ impl World {
             self.impacts.drain(0..drop);
         }
     }
+}
+
+fn hull_in(enabled: bool, colliders: &[Option<Arc<Hull>>], shape: usize) -> Option<&Hull> {
+    if !enabled {
+        return None;
+    }
+    colliders.get(shape).and_then(|h| h.as_deref())
+}
+
+/// The radius of the sphere that is guaranteed to contain a body's collider:
+/// its tuned radius when it collides as a sphere, and its full scale when it
+/// collides as a hull, whose corners reach out to the mesh's bounding sphere.
+fn bound_radius(b: &Body, hulls: bool, colliders: &[Option<Arc<Hull>>]) -> f32 {
+    match hull_in(hulls, colliders, b.shape) {
+        Some(_) => b.scale.max(b.radius),
+        None => b.radius,
+    }
+}
+
+fn placed<'a>(hull: &'a Hull, b: &Body) -> Placed<'a> {
+    Placed {
+        hull,
+        pos: b.pos,
+        rot: Mat3::from_mat4(b.rot),
+        scale: b.scale,
+    }
+}
+
+/// One pair of bodies for one substep: nothing if their bounding spheres are
+/// apart, a nudge if they are exactly concentric, and otherwise the contact —
+/// the inherited sphere rule when both are spheres, the hull rule when either
+/// has one.
+#[allow(clippy::too_many_arguments)]
+fn resolve_pair(
+    a: &mut Body,
+    b: &mut Body,
+    t: Tuning,
+    palette: &[[f32; 3]],
+    hulls: bool,
+    colliders: &[Option<Arc<Hull>>],
+    rng: &mut Rng,
+    impacts: &mut Vec<Impact>,
+) {
+    let hull_a = hull_in(hulls, colliders, a.shape);
+    let hull_b = hull_in(hulls, colliders, b.shape);
+    let either = hull_a.is_some() || hull_b.is_some();
+
+    let d = b.pos - a.pos;
+    let sum = if either {
+        bound_radius(a, hulls, colliders) + bound_radius(b, hulls, colliders)
+    } else {
+        a.radius + b.radius
+    };
+    if d.length_squared() >= sum * sum {
+        return;
+    }
+    if d.length() < 1e-6 {
+        // Perfectly concentric pair: pick any direction to split them.
+        b.pos += Vec3::new(rng.range(-0.02, 0.02), 0.03, rng.range(-0.02, 0.02));
+        return;
+    }
+    let impact = if either {
+        let contact = match (hull_a, hull_b) {
+            (Some(ha), Some(hb)) => placed(ha, a).against_hull(&placed(hb, b)),
+            (Some(ha), None) => placed(ha, a).against_sphere(b.pos, b.radius),
+            // The hull is `b`, so the contact comes back pointing b -> a.
+            (None, Some(hb)) => placed(hb, b).against_sphere(a.pos, a.radius).map(|c| Contact {
+                n: -c.n,
+                depth: c.depth,
+                point: a.pos - c.n * a.radius,
+            }),
+            (None, None) => None,
+        };
+        contact.and_then(|c| collide_rigid_pair(a, b, c, t, palette))
+    } else {
+        collide_pair(a, b, t, palette)
+    };
+    if let Some(impact) = impact {
+        impacts.push(impact);
+    }
+}
+
+/// Every pair of bodies whose bounding spheres are close enough to matter, as
+/// `(i, j)` with `i < j`, in ascending order.
+///
+/// A uniform grid with cells at least as wide as the largest body's diameter:
+/// two bodies can only touch if they are in the same cell or neighbouring ones,
+/// so each body is tested against 27 cells' worth of others instead of all of
+/// them. The small margin covers the position corrections earlier contacts in
+/// the same substep make after this list was built.
+fn grid_pairs(
+    bodies: &[Body],
+    bound: &dyn Fn(&Body) -> f32,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+) -> Vec<(u32, u32)> {
+    const MARGIN: f32 = 0.05;
+    let radii: Vec<f32> = bodies.iter().map(bound).collect();
+    let largest = radii.iter().copied().fold(0.05f32, f32::max);
+    let cell = largest * 2.0 + MARGIN;
+    let dims = [
+        ((2.0 * hx / cell).ceil() as usize).clamp(1, 256),
+        ((hy / cell).ceil() as usize).clamp(1, 256),
+        ((2.0 * hz / cell).ceil() as usize).clamp(1, 256),
+    ];
+    let coord = |v: f32, lo: f32, n: usize| -> usize {
+        (((v - lo) / cell).floor().max(0.0) as usize).min(n - 1)
+    };
+    let cell_of = |b: &Body| -> [usize; 3] {
+        [
+            coord(b.pos.x, -hx, dims[0]),
+            coord(b.pos.y, 0.0, dims[1]),
+            coord(b.pos.z, -hz, dims[2]),
+        ]
+    };
+    let flat = |c: [usize; 3]| (c[1] * dims[2] + c[2]) * dims[0] + c[0];
+
+    // Counting sort of body indices into cells: `starts[c]..starts[c + 1]`
+    // indexes `sorted` for cell `c`.
+    let cells: Vec<usize> = bodies.iter().map(|b| flat(cell_of(b))).collect();
+    let mut starts = vec![0u32; dims[0] * dims[1] * dims[2] + 1];
+    for &c in &cells {
+        starts[c + 1] += 1;
+    }
+    for c in 1..starts.len() {
+        starts[c] += starts[c - 1];
+    }
+    let mut cursor = starts.clone();
+    let mut sorted = vec![0u32; bodies.len()];
+    for (i, &c) in cells.iter().enumerate() {
+        sorted[cursor[c] as usize] = i as u32;
+        cursor[c] += 1;
+    }
+
+    let mut pairs = Vec::new();
+    for (i, a) in bodies.iter().enumerate() {
+        let from = pairs.len();
+        let c = cell_of(a);
+        for y in c[1].saturating_sub(1)..=(c[1] + 1).min(dims[1] - 1) {
+            for z in c[2].saturating_sub(1)..=(c[2] + 1).min(dims[2] - 1) {
+                for x in c[0].saturating_sub(1)..=(c[0] + 1).min(dims[0] - 1) {
+                    let cell_index = flat([x, y, z]);
+                    for &j in &sorted[starts[cell_index] as usize..starts[cell_index + 1] as usize] {
+                        if j as usize <= i {
+                            continue;
+                        }
+                        let reach = radii[i] + radii[j as usize] + MARGIN;
+                        if a.pos.distance_squared(bodies[j as usize].pos) < reach * reach {
+                            pairs.push((i as u32, j));
+                        }
+                    }
+                }
+            }
+        }
+        pairs[from..].sort_unstable();
+    }
+    pairs
 }
 
 /// JS `clamp`. Note the JS order: below `lo` wins even if `lo > hi`.
@@ -727,6 +1051,166 @@ fn collide_pair(
     if approach > PAIR_IMPACT_SPEED {
         return Some(Impact {
             pos: a.pos + n * a.radius,
+            n: -n,
+            color: impact_color(colors, a.shape),
+            base_radius: a.radius.min(b.radius) * 0.5,
+            age: 0.0,
+            life: 0.42,
+        });
+    }
+    None
+}
+
+/// `1 / I` for a body, treating it as a solid sphere of its own radius
+/// (`I = 0.4 m r^2`). The sphere contacts above fold the same assumption into
+/// their constants; the hull contacts need it spelled out because their contact
+/// points are not on the centre line, so a normal impulse has a moment arm.
+fn inverse_inertia(b: &Body) -> f32 {
+    let r = b.scale.max(b.radius).max(0.05);
+    1.0 / (0.4 * b.mass * r * r)
+}
+
+/// A hull against the six walls. For each wall the body's bounding sphere
+/// reaches, the hull's deepest vertices along that wall's normal are found; if
+/// they are through the wall, their centroid is the contact point.
+#[allow(clippy::too_many_arguments)]
+fn collide_hull_with_walls(
+    b: &mut Body,
+    hull: &Hull,
+    t: Tuning,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    colors: &[[f32; 3]],
+    impacts: &mut Vec<Impact>,
+) {
+    let reach = b.scale.max(b.radius);
+    // (inward normal, the value of n.dot(x) on the wall)
+    let walls = [
+        (Vec3::X, -hx),
+        (Vec3::NEG_X, -hx),
+        (Vec3::Y, 0.0),
+        (Vec3::NEG_Y, -hy),
+        (Vec3::Z, -hz),
+        (Vec3::NEG_Z, -hz),
+    ];
+    for (n, offset) in walls {
+        if n.dot(b.pos) - reach > offset {
+            continue;
+        }
+        let (low, point) = placed(hull, b).lowest_along(n);
+        let depth = offset - low;
+        if depth <= 0.0 {
+            continue;
+        }
+        b.pos += n * depth;
+        let point = point + n * depth;
+        let r = point - b.pos;
+        let inv_m = 1.0 / b.mass;
+        let inv_i = inverse_inertia(b);
+
+        let vn = (b.vel + b.ang_vel.cross(r)).dot(n);
+        if vn >= 0.0 {
+            continue;
+        }
+        let approach = -vn;
+        let e = if approach < WALL_REST_SPEED { 0.0 } else { t.restitution };
+        let rn = r.cross(n);
+        let j = (1.0 + e) * approach / (inv_m + inv_i * rn.length_squared());
+        b.vel += n * (j * inv_m);
+        b.ang_vel += rn * (j * inv_i);
+
+        // Coulomb friction on the slip at the contact point, capped by the
+        // normal impulse — so a hull landing on a corner is tripped by it.
+        let vc = b.vel + b.ang_vel.cross(r);
+        let slip = vc - n * vc.dot(n);
+        let speed = slip.length();
+        if speed > 1e-6 {
+            let dir = slip / speed;
+            let rt = r.cross(dir);
+            let jt = (speed / (inv_m + inv_i * rt.length_squared()))
+                .min(t.wall_friction * HULL_FRICTION_SCALE * j);
+            b.vel -= dir * (jt * inv_m);
+            b.ang_vel -= rt * (jt * inv_i);
+        }
+        b.ang_vel *= HULL_CONTACT_SPIN_KEEP;
+        clamp_spin(b);
+
+        if approach > WALL_IMPACT_SPEED {
+            impacts.push(Impact {
+                pos: point,
+                n,
+                color: impact_color(colors, b.shape),
+                base_radius: reach * 0.45,
+                age: 0.0,
+                life: 0.5,
+            });
+        }
+    }
+}
+
+/// Contact between two bodies at least one of which is a hull. The same
+/// impulse as [`collide_pair`], except that the contact point is wherever the
+/// hull test found it rather than on the line between the centres — so the
+/// normal impulse can turn the bodies as well as part them.
+fn collide_rigid_pair(
+    a: &mut Body,
+    b: &mut Body,
+    contact: Contact,
+    t: Tuning,
+    colors: &[[f32; 3]],
+) -> Option<Impact> {
+    let Contact { n, depth, point } = contact;
+    if n == Vec3::ZERO {
+        return None;
+    }
+    let inv_a = 1.0 / a.mass;
+    let inv_b = 1.0 / b.mass;
+    let inv_sum = inv_a + inv_b;
+    let (ii_a, ii_b) = (inverse_inertia(a), inverse_inertia(b));
+
+    let corr = (depth / inv_sum) * 0.7;
+    a.pos -= n * inv_a * corr;
+    b.pos += n * inv_b * corr;
+
+    let ra = point - a.pos;
+    let rb = point - b.pos;
+    let rv = (b.vel + b.ang_vel.cross(rb)) - (a.vel + a.ang_vel.cross(ra));
+    let vn = rv.dot(n);
+    if vn >= 0.0 {
+        return None;
+    }
+    let approach = -vn;
+    let e = if approach < PAIR_REST_SPEED { 0.0 } else { t.restitution };
+    let (ran, rbn) = (ra.cross(n), rb.cross(n));
+    let j = (1.0 + e) * approach
+        / (inv_sum + ii_a * ran.length_squared() + ii_b * rbn.length_squared());
+    a.vel -= n * (j * inv_a);
+    a.ang_vel -= ran * (j * ii_a);
+    b.vel += n * (j * inv_b);
+    b.ang_vel += rbn * (j * ii_b);
+
+    let rv = (b.vel + b.ang_vel.cross(rb)) - (a.vel + a.ang_vel.cross(ra));
+    let slip = rv - n * rv.dot(n);
+    let speed = slip.length();
+    if speed > 1e-6 {
+        let dir = slip / speed;
+        let (rat, rbt) = (ra.cross(dir), rb.cross(dir));
+        let jt = (speed / (inv_sum + ii_a * rat.length_squared() + ii_b * rbt.length_squared()))
+            .min(t.pair_friction * HULL_FRICTION_SCALE * j);
+        a.vel += dir * (jt * inv_a);
+        a.ang_vel += rat * (jt * ii_a);
+        b.vel -= dir * (jt * inv_b);
+        b.ang_vel -= rbt * (jt * ii_b);
+    }
+    a.ang_vel *= HULL_CONTACT_SPIN_KEEP;
+    b.ang_vel *= HULL_CONTACT_SPIN_KEEP;
+    clamp_spin(a);
+    clamp_spin(b);
+
+    if approach > PAIR_IMPACT_SPEED {
+        return Some(Impact {
+            pos: point,
             n: -n,
             color: impact_color(colors, a.shape),
             base_radius: a.radius.min(b.radius) * 0.5,

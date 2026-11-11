@@ -205,9 +205,57 @@ fn an_unsupported_format_is_named_before_the_file_is_still_looked_for() {
 fn the_supported_list_matches_the_hint_the_panel_shows() {
     // The panel renders this string next to the path box; a format added to the
     // reader but not to the list would be invisible, and vice versa.
-    assert_eq!(import::supported_hint(), ".obj or .stl");
+    assert_eq!(import::supported_hint(), ".obj, .stl, .gltf or .glb");
     assert!(import::is_supported(&fixture("spike.obj")));
     assert!(import::is_supported(&fixture("diamond.stl")));
     assert!(import::is_supported(&PathBuf::from("UPPER.OBJ")));
     assert!(!import::is_supported(&PathBuf::from("no extension")));
+}
+
+/// A glTF with two materials on one mesh, a scaled and translated node, and no
+/// normals: the colours have to survive, the transform has to be normalised
+/// away, and the text and binary containers have to agree.
+#[test]
+fn a_gltf_keeps_its_material_colours_in_both_containers() {
+    let text = load("two-tone.gltf");
+    let binary = load("two-tone.glb");
+    for import in [&text, &binary] {
+        assert_eq!(import.mesh.triangle_count(), 8, "{}", import.source);
+        assert!((import.mesh.max_radius() - 1.0).abs() < 1e-4, "normalised, whatever the node said");
+        let colors = import.mesh.colors.as_ref().expect("a glTF brings vertex colours");
+        assert_eq!(colors.len(), import.mesh.vertex_count());
+        // The upper half is the warm material and the lower half the cool one.
+        // The apex vertices tell them apart: every top-apex corner is red-ish,
+        // every bottom-apex corner blue-ish.
+        let mut seen = (0, 0);
+        for (vertex, color) in import.mesh.vertices.iter().zip(colors) {
+            if vertex.position[1] > 0.5 {
+                assert!(color[0] > color[2], "top corner coloured {color:?}");
+                seen.0 += 1;
+            } else if vertex.position[1] < -0.5 {
+                assert!(color[2] > color[0], "bottom corner coloured {color:?}");
+                seen.1 += 1;
+            }
+        }
+        assert!(seen.0 > 0 && seen.1 > 0, "both apexes are present: {seen:?}");
+        // Roughness 0.2 and 0.8 average to a mid gloss, well inside the range.
+        let gloss = import.gloss.expect("a glTF material has a roughness");
+        assert!(gloss > 8.0 && gloss < 96.0, "{gloss}");
+        let hull = import.hull.as_ref().expect("a bipyramid encloses volume");
+        assert_eq!((hull.verts.len(), hull.planes.len()), (6, 8));
+    }
+    assert_eq!(text.mesh.vertices, binary.mesh.vertices);
+    assert_eq!(text.mesh.colors, binary.mesh.colors);
+}
+
+/// OBJ and STL carry no colour, and say so by leaving the mesh's colours empty
+/// — the body is then drawn in the colour the app gives it.
+#[test]
+fn obj_and_stl_bring_a_hull_but_no_colours() {
+    for name in ["spike.obj", "diamond.stl"] {
+        let import = load(name);
+        assert!(import.mesh.colors.is_none(), "{name}");
+        assert!(import.gloss.is_none(), "{name}");
+        assert!(import.hull.is_some(), "{name}");
+    }
 }

@@ -41,3 +41,14 @@ png = "0.18.1"
 # polygons of arbitrary arity into the triangles the renderer draws. Everything
 # that is *not* parsing — welding, normalising, the u16 index budget — is here.
 tobj = "4.0.5"
+# glTF 2.0, text and binary. Without its default features: those decode
+# textures, and this renderer has no texture coordinates to put one on, so the
+# image stack would be dead weight. Buffers are read in `src/import.rs`.
+gltf = { version = "1.4", default-features = false, features = ["utils"] }
+# The system file dialog. On Linux it talks to the desktop portal, so there is
+# no GTK to link against and it works under Wayland, where winit delivers no
+# file drops.
+rfd = "0.18"
+# Recorded clips (`src/record.rs`). GIF because it plays everywhere a README
+# does and needs no codec.
+gif = "0.14"

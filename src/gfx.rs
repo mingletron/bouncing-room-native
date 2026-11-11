@@ -9,8 +9,14 @@
 //!   and wgpu 30 exposes no equivalent, so the coplanar depth conflicts it used
 //!   to settle are settled by moving geometry instead: the room outline is drawn
 //!   a hair inside the box, and wireframe shells a hair outside the body.
-//! * **Per-draw uniforms become one ring buffer with dynamic offsets**, because
-//!   bind groups are not as cheap as `glUniform*` calls were.
+//! * **Per-draw uniforms become per-instance vertex attributes.** Everything
+//!   drawn is an [`Instance`] in one buffer written once a frame, and all the
+//!   bodies of one shape are a single instanced draw — which is what lets the
+//!   room hold thousands of bodies rather than dozens.
+//!
+//! Two things here have no counterpart in the WebGL build at all: the key
+//! light's **shadow cube** (six depth-only passes from the light, sampled by
+//! the lit shader), and a **dynamic line list** for trails and sparks.
 //!
 //! The room's "cull the faces pointing at you" trick needs care too: winding
 //! conventions differ between GL and WebGPU, and which way they differ is
@@ -20,8 +26,10 @@
 //! actually visible. With wgpu 30 the answer is `Ccw`, on Metal and on Vulkan
 //! alike — the same handedness GL used, not the flip the contract predicted.
 
+use std::ops::Range;
+
 use crate::geom::{Mesh, ShapeDef};
-use crate::gpu_types::{self as gt, FrameUniforms, Light, ObjectUniforms, UNIFORM_SLOT_BYTES};
+use crate::gpu_types::{self as gt, FrameUniforms, Instance, Light, LineVertex};
 use crate::sim::Body;
 
 use glam::{Mat4, Vec3, Vec4};
@@ -30,9 +38,10 @@ use glam::{Mat4, Vec3, Vec4};
 /// target, so egui itself is not multisampled (it does not need to be).
 pub const SAMPLE_COUNT: u32 = 4;
 
-/// Slots in the per-object uniform ring: bodies + discs + panels + rings for one
-/// frame, comfortably more than the UI allows. The buffer grows if exceeded.
-const OBJECT_SLOTS_START: usize = 512;
+/// Instances the buffer starts with room for. It doubles when a frame needs more.
+const INSTANCES_START: usize = 1024;
+/// Line vertices the trail buffer starts with room for.
+const LINES_START: usize = 4096;
 
 /// The room outline is drawn scaled toward the room centre by this much, so its
 /// lines sit fractionally in front of the coplanar walls. This replaces the
@@ -50,14 +59,27 @@ const RING_MIN_APPARENT_SIZE: f32 = 0.04;
 /// geometry.
 const RING_MIN_FACING: f32 = 0.18;
 
+/// Edge length of each face of the shadow cube, in texels.
+const SHADOW_SIZE: u32 = 1024;
+/// The shadow cube's depth range. The far plane only has to clear the room's
+/// longest diagonal from the key light.
+const SHADOW_NEAR: f32 = 0.08;
+const SHADOW_FAR: f32 = 30.0;
+/// How dark a shadow gets: the fraction of the key light it removes.
+const SHADOW_STRENGTH: f32 = 0.82;
+/// Subtracted from the reference depth, on top of the pipeline's own slope bias.
+const SHADOW_BIAS: f32 = 0.0004;
+/// Each cube face's view-projection sits in its own slot of one uniform buffer,
+/// picked by dynamic offset. 256 covers every backend's offset alignment.
+const FACE_SLOT_BYTES: u64 = 256;
+
 const LIT_SRC: &str = include_str!("../shaders/lit.wgsl");
 const LINE_SRC: &str = include_str!("../shaders/line.wgsl");
 const FLAT_SRC: &str = include_str!("../shaders/flat.wgsl");
+const TRAIL_SRC: &str = include_str!("../shaders/trail.wgsl");
+const SHADOW_SRC: &str = include_str!("../shaders/shadow.wgsl");
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-/// Sentinel meaning "this item produced no uniform slot, so skip its draw".
-const SKIP: u32 = u32::MAX;
 
 #[derive(Copy, Clone, Debug)]
 pub struct GfxOptions {
@@ -134,10 +156,19 @@ pub struct Scene<'a> {
     pub quad_mesh: usize,
     pub ring_mesh: usize,
     pub wireframe: bool,
+    /// Bodies cast real shadows from the key light. When this is on the caller
+    /// normally passes no `blobs`, which are the stand-in for exactly that.
+    pub shadows: bool,
+    /// World-space line segments, two vertices each: trails and sparks.
+    pub lines: &'a [LineVertex],
+    /// A body to draw a bright wire shell around — the one being held.
+    pub outlined: Option<usize>,
 }
 
 struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
+    /// One RGBA8 per vertex, white unless the mesh brought its own.
+    color_buffer: wgpu::Buffer,
     index_buffer: Option<(wgpu::Buffer, u32)>,
     line_buffer: Option<(wgpu::Buffer, u32)>,
     vertex_count: u32,
@@ -150,6 +181,26 @@ struct Pipelines {
     object: wgpu::RenderPipeline,
     flat: wgpu::RenderPipeline,
     line: wgpu::RenderPipeline,
+    trail: wgpu::RenderPipeline,
+    shadow: wgpu::RenderPipeline,
+}
+
+/// The MSAA colour and depth attachments for one output size.
+struct Targets {
+    extent: (u32, u32, wgpu::TextureFormat),
+    msaa: wgpu::Texture,
+    depth: wgpu::Texture,
+}
+
+/// Where each kind of thing landed in this frame's instance buffer.
+#[derive(Default)]
+struct Staged {
+    discs: Range<u32>,
+    /// `(mesh handle, instances)` — one entry per shape that has bodies.
+    bodies: Vec<(usize, Range<u32>)>,
+    outline: u32,
+    wires: Vec<(usize, Range<u32>)>,
+    rings: Range<u32>,
 }
 
 pub struct Gfx {
@@ -162,24 +213,25 @@ pub struct Gfx {
     adapter: wgpu::Adapter,
     options: GfxOptions,
     pipelines: Pipelines,
-    // The frame bind group layout is not stored: the frame uniform buffer is a
-    // fixed size, so its bind group is built once and never rebuilt. The object
-    // ring can grow, so that layout has to stay (`bgl_object`).
-    bgl_object: wgpu::BindGroupLayout,
     frame_buffer: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
-    object_buffer: wgpu::Buffer,
-    object_bg: wgpu::BindGroup,
-    object_slots: usize,
-    object_staging: Vec<u8>,
-    next_slot: usize,
-    /// Byte offset into the ring buffer for each draw of the frame, in draw
-    /// order; `SKIP` marks a draw to leave out.
-    slot_offsets: Vec<u32>,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    instances: Vec<Instance>,
+    staged: Staged,
+    line_buffer: wgpu::Buffer,
+    line_capacity: usize,
     meshes: Vec<GpuMesh>,
-    msaa_texture: Option<wgpu::Texture>,
-    depth_texture: Option<wgpu::Texture>,
-    extent: (u32, u32, wgpu::TextureFormat),
+    /// Attachments per output size. Two sizes are live at once while a clip is
+    /// being recorded — the window's and the clip's — and rebuilding them every
+    /// frame as the two alternate would be a texture allocation per frame.
+    targets: Vec<Targets>,
+    /// One view per face of the shadow cube, to render into.
+    shadow_faces: Vec<wgpu::TextureView>,
+    /// The cube as the lit shader samples it.
+    shadow_bg: wgpu::BindGroup,
+    face_buffer: wgpu::Buffer,
+    face_bg: wgpu::BindGroup,
 }
 
 /// Where the 3D pass resolves its MSAA output.
@@ -213,8 +265,34 @@ fn padded_index_bytes(indices: &[u16]) -> Vec<u8> {
     bytes
 }
 
+/// The six view-projections of a shadow cube centred on `light`, in the cube
+/// map's own face order (+X, -X, +Y, -Y, +Z, -Z).
+///
+/// Cube maps are left-handed: on the +X face, +Y is up and -Z is to the right.
+/// A right-handed view would render each face mirrored, so these are built with
+/// the left-handed look-to and projection, and the lit shader can then sample
+/// with the plain world-space direction from the light.
+pub fn shadow_face_matrices(light: Vec3) -> [Mat4; 6] {
+    use glam::camera::lh;
+    let proj = lh::proj::directx::perspective(
+        std::f32::consts::FRAC_PI_2,
+        1.0,
+        SHADOW_NEAR,
+        SHADOW_FAR,
+    );
+    let faces = [
+        (Vec3::X, Vec3::Y),
+        (Vec3::NEG_X, Vec3::Y),
+        (Vec3::Y, Vec3::NEG_Z),
+        (Vec3::NEG_Y, Vec3::Z),
+        (Vec3::Z, Vec3::Y),
+        (Vec3::NEG_Z, Vec3::Y),
+    ];
+    faces.map(|(dir, up)| proj * lh::view::look_to_mat4(light, dir, up))
+}
+
 impl Gfx {
-    /// Create a device and all four pipelines against an existing `instance`.
+    /// Create a device and every pipeline against an existing `instance`.
     ///
     /// The instance belongs to the caller because wgpu 30 binds it to a window
     /// system display handle (`InstanceDescriptor::display`, supplied by winit),
@@ -223,9 +301,9 @@ impl Gfx {
     /// surface here to pick a format-capable adapter, while the headless probe
     /// passes `None`.
     ///
-    /// There are four pipelines rather than three because culling is pipeline
-    /// state in WebGPU: the room needs front-face culling and the primitives need
-    /// none, even though both run the same shaders.
+    /// The room and the bodies get a pipeline each although both run the lit
+    /// shader, because culling is pipeline state in WebGPU: the room needs
+    /// front-face culling and the primitives need none.
     pub fn new(
         instance: &wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
@@ -237,13 +315,10 @@ impl Gfx {
         }))
         .map_err(|e| format!("no suitable GPU adapter: {e:?}"))?;
 
-        // Default limits are enough, and asking for more is what kept this off
-        // Linux. `max_uniform_buffer_binding_size` bounds one *binding*, not the
-        // buffer behind it, and the object ring is bound one `ObjectUniforms` at
-        // a time (see `make_object_bind_group`) however many slots it holds.
-        // Raising the limit to the whole ring's 128 KiB was never needed — Metal
-        // just happened to grant it, where Vulkan drivers commonly stop at the
-        // 64 KiB default (NVIDIA's `maxUniformBufferRange`) and refuse the device.
+        // Default limits are enough, and asking for more is what once kept this
+        // off Linux: a raised `max_uniform_buffer_binding_size` that Metal
+        // granted and Vulkan drivers refuse. Nothing here binds more than one
+        // small uniform block at a time.
         let limits = wgpu::Limits::default();
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -270,18 +345,17 @@ impl Gfx {
             None => wgpu::TextureFormat::Rgba8Unorm,
         };
 
-        let lit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("lit"),
-            source: wgpu::ShaderSource::Wgsl(LIT_SRC.into()),
-        });
-        let line_src = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("line"),
-            source: wgpu::ShaderSource::Wgsl(LINE_SRC.into()),
-        });
-        let flat = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("flat"),
-            source: wgpu::ShaderSource::Wgsl(FLAT_SRC.into()),
-        });
+        let module = |label: &str, source: &str| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
+        };
+        let lit = module("lit", LIT_SRC);
+        let line_src = module("line", LINE_SRC);
+        let flat = module("flat", FLAT_SRC);
+        let trail = module("trail", TRAIL_SRC);
+        let shadow = module("shadow", SHADOW_SRC);
 
         let bgl_frame = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
@@ -300,32 +374,58 @@ impl Gfx {
                 count: None,
             }],
         });
-
-        // One bind group for the whole frame: the slot is chosen per draw with a
-        // dynamic offset, which is far cheaper than a bind group per object.
-        let bgl_object = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("object"),
+        // The shadow cube as the lit shader reads it.
+        let bgl_shadow_read = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow read"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        // One cube face's view-projection, chosen per pass by dynamic offset.
+        let bgl_face = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow face"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<ObjectUniforms>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(64),
                 },
                 count: None,
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene"),
-            // wgpu 30: a pipeline layout entry is `Option<&BindGroupLayout>`
-            // (the `None` slot means "set the layout at pipeline creation"), and
-            // push constants are now `immediate_size` — a byte count, not a list
-            // of stages. We use no immediates.
-            bind_group_layouts: &[Some(&bgl_frame), Some(&bgl_object)],
+        // wgpu 30: a pipeline layout entry is `Option<&BindGroupLayout>`, and
+        // push constants are now `immediate_size` — a byte count. None are used.
+        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lit"),
+            bind_group_layouts: &[Some(&bgl_frame), Some(&bgl_shadow_read)],
+            immediate_size: 0,
+        });
+        let plain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plain"),
+            bind_group_layouts: &[Some(&bgl_frame)],
+            immediate_size: 0,
+        });
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow"),
+            bind_group_layouts: &[Some(&bgl_face)],
             immediate_size: 0,
         });
 
@@ -358,56 +458,78 @@ impl Gfx {
             })
         };
 
-        // One vertex layout for every mesh and every pipeline. `buffers` is a
-        // list of `Option<VertexBufferLayout>` in wgpu 30 (a `None` slot means
-        // "this slot is unused"), and the attribute array has to outlive the
-        // layout, so both are locals here rather than temporaries in the
-        // descriptors. All four pipelines read position at location 0 and the
-        // normal at location 1, even where a shader ignores the normal.
+        // Three vertex buffers for every mesh pipeline: the mesh's positions and
+        // normals, its per-vertex colours, and the per-instance block. A shader
+        // that does not read an attribute simply does not declare it — the flat
+        // and line shaders ignore the normal and the vertex colour — which is
+        // what keeps one layout for all of them. `buffers` is a list of
+        // `Option<VertexBufferLayout>` in wgpu 30, and the attribute arrays have
+        // to outlive the layouts, so they are locals rather than temporaries.
         let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-        let vertex_layouts = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<crate::geom::Vertex>() as u64,
+        let color_attrs = wgpu::vertex_attr_array![8 => Unorm8x4];
+        let instance_attrs = wgpu::vertex_attr_array![
+            2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
+            6 => Float32x4, 7 => Float32x4
+        ];
+        let vertex_layouts = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<crate::geom::Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &vertex_attrs,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 4,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &color_attrs,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Instance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &instance_attrs,
+            }),
+        ];
+        let trail_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let trail_layouts = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &vertex_attrs,
+            attributes: &trail_attrs,
         })];
 
-        let room = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("room"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &lit,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &vertex_layouts,
-            },
-            primitive: wgpu::PrimitiveState {
+        let lit_pipeline = |label: &str, primitive: wgpu::PrimitiveState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&lit_layout),
+                vertex: wgpu::VertexState {
+                    module: &lit,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &vertex_layouts,
+                },
+                primitive,
+                depth_stencil: Some(depth()),
+                multisample: multisample.clone(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &lit,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[opaque_target(surface_format)],
+                }),
+                cache: None,
+                multiview_mask: None,
+            })
+        };
+        let room = lit_pipeline(
+            "room",
+            wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: options.room_front_face,
                 cull_mode: Some(wgpu::Face::Front),
                 ..Default::default()
             },
-            depth_stencil: Some(depth()),
-            multisample: multisample.clone(),
-            fragment: Some(wgpu::FragmentState {
-                module: &lit,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[opaque_target(surface_format)],
-            }),
-            cache: None,
-            multiview_mask: None,
-        });
-
-        let object = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("object"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &lit,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &vertex_layouts,
-            },
-            primitive: wgpu::PrimitiveState {
+        );
+        let object = lit_pipeline(
+            "object",
+            wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 // Primitives are double sided: their normals are analytic and
                 // always face out, and the shader flips any normal that faces
@@ -415,28 +537,15 @@ impl Gfx {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(depth()),
-            multisample: multisample.clone(),
-            fragment: Some(wgpu::FragmentState {
-                module: &lit,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[opaque_target(surface_format)],
-            }),
-            cache: None,
-            multiview_mask: None,
-        });
+        );
 
         let flat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("flat"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&plain_layout),
             vertex: wgpu::VertexState {
                 module: &flat,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                // The flat and line shaders read only position; the normal sits
-                // in the same buffer at location 1 and is simply not consumed,
-                // which is what keeps one vertex layout for every mesh.
                 buffers: &vertex_layouts,
             },
             primitive: wgpu::PrimitiveState {
@@ -460,9 +569,16 @@ impl Gfx {
             multiview_mask: None,
         });
 
+        // Lines sit coplanar with, or just inside, the surfaces they describe, so
+        // equal depth has to win; and they never write depth.
+        let line_depth = || wgpu::DepthStencilState {
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            ..depth()
+        };
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("line"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&plain_layout),
             vertex: wgpu::VertexState {
                 module: &line_src,
                 entry_point: Some("vs_main"),
@@ -474,20 +590,68 @@ impl Gfx {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                depth_write_enabled: Some(false),
-                // Lines sit coplanar with, or just inside, the surfaces they
-                // describe, so equal depth has to win.
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                ..depth()
-            }),
-            multisample,
+            depth_stencil: Some(line_depth()),
+            multisample: multisample.clone(),
             fragment: Some(wgpu::FragmentState {
                 module: &line_src,
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[blended_target(surface_format)],
             }),
+            cache: None,
+            multiview_mask: None,
+        });
+        let trail_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("trail"),
+            layout: Some(&plain_layout),
+            vertex: wgpu::VertexState {
+                module: &trail,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &trail_layouts,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(line_depth()),
+            multisample,
+            fragment: Some(wgpu::FragmentState {
+                module: &trail,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[blended_target(surface_format)],
+            }),
+            cache: None,
+            multiview_mask: None,
+        });
+        // Depth only: no fragment stage and no colour target. The slope bias is
+        // what keeps a surface from shadowing itself at a grazing angle.
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &vertex_layouts,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+                ..depth()
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
             cache: None,
             multiview_mask: None,
         });
@@ -507,9 +671,90 @@ impl Gfx {
             }],
         });
 
-        let object_slots = OBJECT_SLOTS_START;
-        let object_buffer = make_object_buffer(&device, object_slots);
-        let object_bg = make_object_bind_group(&device, &bgl_object, &object_buffer);
+        // The shadow cube: one six-layer depth texture, viewed once as a cube for
+        // sampling and once per layer for rendering.
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow cube"),
+            size: wgpu::Extent3d {
+                width: SHADOW_SIZE,
+                height: SHADOW_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_faces = (0..6)
+            .map(|layer| {
+                shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("shadow face"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let shadow_cube = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow cube"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // Lit where the surface is no farther from the light than what the
+            // cube recorded in that direction.
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow read"),
+            layout: &bgl_shadow_read,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&shadow_cube),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
+        });
+        let face_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow faces"),
+            size: FACE_SLOT_BYTES * 6,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let face_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow face"),
+            layout: &bgl_face,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &face_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(64),
+                }),
+            }],
+        });
+
+        let instance_buffer = make_vertex_buffer(
+            &device,
+            "instances",
+            INSTANCES_START * std::mem::size_of::<Instance>(),
+        );
+        let line_buffer = make_vertex_buffer(
+            &device,
+            "trail lines",
+            LINES_START * std::mem::size_of::<LineVertex>(),
+        );
 
         Ok(Gfx {
             device,
@@ -522,20 +767,23 @@ impl Gfx {
                 object,
                 flat: flat_pipeline,
                 line: line_pipeline,
+                trail: trail_pipeline,
+                shadow: shadow_pipeline,
             },
-            bgl_object,
             frame_buffer,
             frame_bg,
-            object_buffer,
-            object_bg,
-            object_slots,
-            object_staging: Vec::new(),
-            next_slot: 0,
-            slot_offsets: Vec::new(),
+            instance_buffer,
+            instance_capacity: INSTANCES_START,
+            instances: Vec::new(),
+            staged: Staged::default(),
+            line_buffer,
+            line_capacity: LINES_START,
             meshes: Vec::new(),
-            msaa_texture: None,
-            depth_texture: None,
-            extent: (0, 0, surface_format),
+            targets: Vec::new(),
+            shadow_faces,
+            shadow_bg,
+            face_buffer,
+            face_bg,
         })
     }
 
@@ -570,6 +818,26 @@ impl Gfx {
         });
         self.queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
 
+        // Every mesh gets a colour per vertex, white when it brought none, so
+        // one pipeline layout serves the generated primitives and a coloured
+        // import alike. Four bytes a vertex is a cheap price for that.
+        let white;
+        let colors: &[[u8; 4]] = match &mesh.colors {
+            Some(colors) if colors.len() == mesh.vertices.len() => colors,
+            _ => {
+                white = vec![[255u8; 4]; mesh.vertices.len()];
+                &white
+            }
+        };
+        let color_bytes = bytemuck::cast_slice::<_, u8>(colors);
+        let color_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vertex colours"),
+            size: (color_bytes.len().max(4)) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&color_buffer, 0, color_bytes);
+
         let index_buffer = mesh.indices.as_ref().map(|idx| {
             let bytes = padded_index_bytes(idx);
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -599,6 +867,7 @@ impl Gfx {
         let handle = self.meshes.len();
         self.meshes.push(GpuMesh {
             vertex_buffer,
+            color_buffer,
             index_buffer,
             line_buffer,
             vertex_count: mesh.vertex_count() as u32,
@@ -606,17 +875,19 @@ impl Gfx {
         handle
     }
 
-    fn ensure_targets(&mut self, width: u32, height: u32, format: wgpu::TextureFormat) {
-        if self.extent == (width, height, format) {
-            return;
+    /// The attachments for this output size, made on first use. Returns their
+    /// index in `self.targets`.
+    fn ensure_targets(&mut self, width: u32, height: u32, format: wgpu::TextureFormat) -> usize {
+        let extent = (width, height, format);
+        if let Some(found) = self.targets.iter().position(|t| t.extent == extent) {
+            return found;
         }
-        self.extent = (width, height, format);
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
-        self.msaa_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+        let msaa = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("msaa colour"),
             size,
             mip_level_count: 1,
@@ -625,8 +896,8 @@ impl Gfx {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
-        }));
-        self.depth_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+        });
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
             size,
             mip_level_count: 1,
@@ -635,13 +906,26 @@ impl Gfx {
             format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
-        }));
+        });
+        // Two sizes at most are ever in use together (the window and a clip
+        // being recorded), so anything beyond that is a size the window has
+        // since been resized away from: the oldest goes.
+        if self.targets.len() >= 2 {
+            self.targets.remove(0);
+        }
+        self.targets.push(Targets { extent, msaa, depth });
+        self.targets.len() - 1
     }
 
-    /// Record the whole 3D pass into `encoder`, resolving MSAA onto `target`.
+    /// Record the shadow passes and the whole 3D pass into `encoder`, resolving
+    /// MSAA onto `target`.
     ///
     /// The caller then opens a second pass on the same target with load op `Load`
     /// for the UI, which draws without multisampling.
+    ///
+    /// The buffers this writes are read when the encoder is *submitted*, so two
+    /// calls must not share one submission: the second would overwrite what the
+    /// first staged. [`Gfx::render_to_pixels`] submits its own for that reason.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -650,8 +934,9 @@ impl Gfx {
     ) {
         let width = target.width.max(1);
         let height = target.height.max(1);
-        self.ensure_targets(width, height, target.format);
+        let targets = self.ensure_targets(width, height, target.format);
 
+        let vec4 = |c: [f32; 3], a: f32| Vec4::new(c[0], c[1], c[2], a);
         self.queue.write_buffer(
             &self.frame_buffer,
             0,
@@ -660,26 +945,59 @@ impl Gfx {
                 proj: scene.proj,
                 lights: scene.lights,
                 cam_pos: Vec4::new(scene.eye.x, scene.eye.y, scene.eye.z, 0.0),
+                floor_color: vec4(scene.room.floor, 1.0),
+                ceil_color: vec4(scene.room.ceil, 1.0),
+                shadow: Vec4::new(
+                    SHADOW_NEAR,
+                    SHADOW_FAR,
+                    if scene.shadows { SHADOW_STRENGTH } else { 0.0 },
+                    SHADOW_BIAS,
+                ),
             }),
         );
 
-        // Stage every per-object uniform up front, in exactly the order the draw
-        // loop below consumes them, so the ring buffer is written once per frame.
-        self.stage_object_uniforms(scene);
+        // Stage every instance up front, so the buffer is written once a frame.
+        self.stage_instances(scene);
+        if self.instances.len() > self.instance_capacity {
+            self.instance_capacity = self.instances.len().next_power_of_two();
+            self.instance_buffer = make_vertex_buffer(
+                &self.device,
+                "instances",
+                self.instance_capacity * std::mem::size_of::<Instance>(),
+            );
+        }
         self.queue
-            .write_buffer(&self.object_buffer, 0, &self.object_staging);
+            .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+
+        // Line segments come in pairs; an odd tail would be half a segment.
+        let line_count = scene.lines.len() & !1;
+        if line_count > self.line_capacity {
+            self.line_capacity = line_count.next_power_of_two();
+            self.line_buffer = make_vertex_buffer(
+                &self.device,
+                "trail lines",
+                self.line_capacity * std::mem::size_of::<LineVertex>(),
+            );
+        }
+        if line_count > 0 {
+            self.queue.write_buffer(
+                &self.line_buffer,
+                0,
+                bytemuck::cast_slice(&scene.lines[..line_count]),
+            );
+        }
+
+        if scene.shadows {
+            self.render_shadows(encoder, scene);
+        }
 
         // The views have to outlive the render pass, so they are locals here
         // rather than temporaries inside the descriptor.
-        let msaa_view = self
-            .msaa_texture
-            .as_ref()
-            .expect("msaa target")
+        let msaa_view = self.targets[targets]
+            .msaa
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_view = self
-            .depth_texture
-            .as_ref()
-            .expect("depth target")
+        let depth_view = self.targets[targets]
+            .depth
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -716,166 +1034,338 @@ impl Gfx {
         });
 
         pass.set_bind_group(0, &self.frame_bg, &[]);
-        self.next_slot = 0;
+        pass.set_vertex_buffer(2, self.instance_buffer.slice(..));
 
         // 1. the room: front-face culling leaves the interior visible from
-        // outside, and fully enclosed from inside.
+        // outside, and fully enclosed from inside. It is instance 0.
         pass.set_pipeline(&self.pipelines.room);
-        self.bind_and_fill(&mut pass, scene.room.mesh);
+        pass.set_bind_group(1, &self.shadow_bg, &[]);
+        self.fill(&mut pass, scene.room.mesh, 0..1);
 
         // 2. ground discs, then the ceiling fixture
-        pass.set_pipeline(&self.pipelines.flat);
-        for _ in scene.blobs.iter().chain(scene.panels.iter()) {
-            let offset = self.take_slot();
-            if offset == SKIP {
-                continue;
-            }
-            pass.set_bind_group(1, &self.object_bg, &[offset]);
-            self.fill(&mut pass, scene.quad_mesh);
+        if !self.staged.discs.is_empty() {
+            pass.set_pipeline(&self.pipelines.flat);
+            self.fill(&mut pass, scene.quad_mesh, self.staged.discs.clone());
         }
 
-        // 3. the primitives
+        // 3. the primitives, one draw per shape
         pass.set_pipeline(&self.pipelines.object);
-        for body in scene.bodies {
-            let offset = self.take_slot();
-            pass.set_bind_group(1, &self.object_bg, &[offset]);
-            self.fill(&mut pass, scene.shape_mesh[body.shape]);
+        for (mesh, range) in &self.staged.bodies {
+            self.fill(&mut pass, *mesh, range.clone());
         }
 
         // 4. lines: room outline, wireframe shells, impact rings
         pass.set_pipeline(&self.pipelines.line);
-        self.bind_and_outline(&mut pass, scene.room.mesh);
-
-        if scene.wireframe {
-            for body in scene.bodies {
-                let offset = self.take_slot();
-                pass.set_bind_group(1, &self.object_bg, &[offset]);
-                self.outline(&mut pass, scene.shape_mesh[body.shape]);
-            }
+        self.outline(
+            &mut pass,
+            scene.room.mesh,
+            self.staged.outline..self.staged.outline + 1,
+        );
+        for (mesh, range) in &self.staged.wires {
+            self.outline(&mut pass, *mesh, range.clone());
+        }
+        if !self.staged.rings.is_empty() {
+            self.outline(&mut pass, scene.ring_mesh, self.staged.rings.clone());
         }
 
-        let ring_handle = scene.ring_mesh;
-        for _ in scene.rings.iter() {
-            let offset = self.take_slot();
-            if offset == SKIP {
-                continue;
-            }
-            pass.set_bind_group(1, &self.object_bg, &[offset]);
-            self.outline(&mut pass, ring_handle);
+        // 5. trails and sparks
+        if line_count > 0 {
+            pass.set_pipeline(&self.pipelines.trail);
+            pass.set_vertex_buffer(0, self.line_buffer.slice(..));
+            pass.draw(0..line_count as u32, 0..1);
         }
     }
 
-    /// The room uses the same uniform slot as the first staged entry, and the
-    /// outline reuses it because the outline's model transform is baked into the
-    /// geometry it draws — see `ROOM_OUTLINE_INWARD`.
-    fn bind_and_fill(&mut self, pass: &mut wgpu::RenderPass<'_>, mesh: usize) {
-        let offset = self.take_slot();
-        pass.set_bind_group(1, &self.object_bg, &[offset]);
-        self.fill(pass, mesh);
+    /// Six depth-only passes from the key light, one per cube face. Only the
+    /// bodies are drawn: the room is what the shadows fall on.
+    fn render_shadows(&self, encoder: &mut wgpu::CommandEncoder, scene: &Scene<'_>) {
+        let light = scene.lights[0].pos.truncate();
+        for (i, m) in shadow_face_matrices(light).iter().enumerate() {
+            self.queue.write_buffer(
+                &self.face_buffer,
+                i as u64 * FACE_SLOT_BYTES,
+                bytemuck::bytes_of(m),
+            );
+        }
+        for (i, face) in self.shadow_faces.iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: face,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipelines.shadow);
+            pass.set_bind_group(0, &self.face_bg, &[(i as u64 * FACE_SLOT_BYTES) as u32]);
+            pass.set_vertex_buffer(2, self.instance_buffer.slice(..));
+            for (mesh, range) in &self.staged.bodies {
+                self.fill(&mut pass, *mesh, range.clone());
+            }
+        }
     }
 
-    fn bind_and_outline(&mut self, pass: &mut wgpu::RenderPass<'_>, mesh: usize) {
-        let offset = self.take_slot();
-        pass.set_bind_group(1, &self.object_bg, &[offset]);
-        self.outline(pass, mesh);
+    /// Render `scene` at `width` x `height` with no window involved and read the
+    /// picture back as tightly packed RGBA rows, top row first.
+    ///
+    /// This is what a recorded clip is made of. It submits its own command
+    /// buffer and waits for the copy, so it costs a few milliseconds a call.
+    pub fn render_to_pixels(
+        &mut self,
+        scene: &Scene<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        let format = self.surface_format;
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture"),
+            });
+        self.render(
+            &mut encoder,
+            &RenderTarget {
+                view: &view,
+                format,
+                width,
+                height,
+            },
+            scene,
+        );
+
+        // Rows have to start on a 256-byte boundary, so the staging row is wider
+        // than the image and the loop below un-pads it.
+        let unpadded = width * 4;
+        let padded = unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture readback"),
+            size: u64::from(padded) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            extent,
+        );
+        let submission = self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (sender, reader) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .map_err(|e| format!("device poll failed: {e:?}"))?;
+        reader
+            .recv()
+            .map_err(|_| "the map callback never ran".to_owned())?
+            .map_err(|e| format!("the readback buffer failed to map: {e:?}"))?;
+
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| format!("mapped range unavailable: {e:?}"))?;
+        let mut pixels = vec![0u8; (unpadded * height) as usize];
+        for row in 0..height as usize {
+            let from = row * padded as usize;
+            let to = row * unpadded as usize;
+            pixels[to..to + unpadded as usize]
+                .copy_from_slice(&data[from..from + unpadded as usize]);
+        }
+        drop(data);
+        staging.unmap();
+
+        // Byte order follows the format name; the clip wants RGBA.
+        if matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok(pixels)
     }
 
-    fn fill(&self, pass: &mut wgpu::RenderPass<'_>, mesh: usize) {
+    fn fill(&self, pass: &mut wgpu::RenderPass<'_>, mesh: usize, instances: Range<u32>) {
         let m = &self.meshes[mesh];
         pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, m.color_buffer.slice(..));
         match &m.index_buffer {
             Some((buf, count)) => {
                 pass.set_index_buffer(buf.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..*count, 0, 0..1);
+                pass.draw_indexed(0..*count, 0, instances);
             }
             // No index buffer means the vertex list *is* the triangle list
             // (the flat-shaded primitives are built that way).
-            None => pass.draw(0..m.vertex_count, 0..1),
+            None => pass.draw(0..m.vertex_count, instances),
         }
     }
 
-    fn outline(&self, pass: &mut wgpu::RenderPass<'_>, mesh: usize) {
+    fn outline(&self, pass: &mut wgpu::RenderPass<'_>, mesh: usize, instances: Range<u32>) {
         let m = &self.meshes[mesh];
         pass.set_vertex_buffer(0, m.vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, m.color_buffer.slice(..));
         if let Some((buf, count)) = &m.line_buffer {
             pass.set_index_buffer(buf.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..*count, 0, 0..1);
+            pass.draw_indexed(0..*count, 0, instances);
         }
     }
 
-    fn take_slot(&mut self) -> u32 {
-        let v = self.slot_offsets.get(self.next_slot).copied().unwrap_or(0);
-        self.next_slot += 1;
-        v
-    }
-
-    /// Build the ring-buffer contents in draw order and return the byte offset of
-    /// each draw, or `SKIP` for an item the camera cannot see.
-    fn stage_object_uniforms(&mut self, scene: &Scene<'_>) {
-        self.object_staging.clear();
-        self.slot_offsets.clear();
-
+    /// Build this frame's instance list and note where each kind of thing sits
+    /// in it. Bodies are grouped by shape, because one shape is one draw.
+    fn stage_instances(&mut self, scene: &Scene<'_>) {
+        self.instances.clear();
+        let mut staged = Staged::default();
         let vec4 = |c: [f32; 3], a: f32| Vec4::new(c[0], c[1], c[2], a);
 
-        // room fill
-        self.push_object(&ObjectUniforms {
-            model: Mat4::IDENTITY,
-            color: vec4(scene.room.wall, 1.0),
-            params: Vec4::new(14.0, 0.16, 1.0, scene.room.grid_spacing),
-            floor_color: vec4(scene.room.floor, 1.0),
-            ceil_color: vec4(scene.room.ceil, 1.0),
-        });
+        // room fill — always instance 0
+        self.instances.push(Instance::new(
+            Mat4::IDENTITY,
+            vec4(scene.room.wall, 1.0),
+            Vec4::new(14.0, 0.16, 1.0, scene.room.grid_spacing),
+        ));
 
         // ground discs + ceiling panel: one-sided, so a disc whose plane faces
         // away is skipped rather than hanging in mid-air through a culled wall.
+        let start = self.instances.len() as u32;
         for disc in scene.blobs.iter().chain(scene.panels.iter()) {
             let facing = facing_toward(disc.normal, disc.center, scene.eye);
             if facing <= 0.02 {
-                self.slot_offsets.push(SKIP);
                 continue;
             }
             let fade = (facing * 6.0).min(1.0);
-            self.push_object(&ObjectUniforms {
-                model: gt::disc_matrix(disc.center, disc.normal, disc.radius, 0.006),
-                color: vec4(disc.color, 1.0),
-                params: Vec4::new(disc.alpha * fade, disc.inner, 0.0, 0.0),
-                ..Default::default()
-            });
+            self.instances.push(Instance::new(
+                gt::disc_matrix(disc.center, disc.normal, disc.radius, 0.006),
+                vec4(disc.color, 1.0),
+                Vec4::new(disc.alpha * fade, disc.inner, 0.0, 0.0),
+            ));
         }
+        staged.discs = start..self.instances.len() as u32;
 
-        // bodies
+        // bodies, grouped by shape: count each shape, then give every shape a
+        // contiguous run and drop its bodies into it.
+        let shape_count = scene.shapes.len();
+        let mut counts = vec![0u32; shape_count];
+        for body in scene.bodies {
+            counts[body.shape] += 1;
+        }
+        let body_base = self.instances.len() as u32;
+        let mut next = Vec::with_capacity(shape_count);
+        let mut cursor = body_base;
+        for (shape, &count) in counts.iter().enumerate() {
+            next.push(cursor);
+            if count > 0 {
+                staged
+                    .bodies
+                    .push((scene.shape_mesh[shape], cursor..cursor + count));
+            }
+            cursor += count;
+        }
+        let body_total = (cursor - body_base) as usize;
+        self.instances.resize(
+            self.instances.len() + body_total,
+            Instance::new(Mat4::IDENTITY, Vec4::ONE, Vec4::ZERO),
+        );
         for body in scene.bodies {
             let shape = &scene.shapes[body.shape];
-            self.push_object(&ObjectUniforms {
-                model: gt::model_matrix(body.pos, body.rot, body.scale),
-                color: vec4(shape.color, 1.0),
-                params: Vec4::new(shape.gloss, 0.9, 0.0, 1.0),
-                ..Default::default()
-            });
+            let slot = next[body.shape];
+            next[body.shape] += 1;
+            self.instances[slot as usize] = Instance::new(
+                gt::model_matrix(body.pos, body.rot, body.scale),
+                vec4(shape.color, 1.0),
+                Vec4::new(shape.gloss, 0.9, 0.0, 1.0),
+            );
         }
 
         // room outline, pulled slightly inward about the room centre so its lines
         // win the equal-depth test against the coplanar walls
         let half = Vec3::from(scene.room.half);
         let centre = Vec3::new(0.0, half.y * 0.5, 0.0);
-        self.push_object(&ObjectUniforms {
-            model: Mat4::from_translation(centre)
+        staged.outline = self.instances.len() as u32;
+        self.instances.push(Instance::new(
+            Mat4::from_translation(centre)
                 * Mat4::from_scale(Vec3::splat(ROOM_OUTLINE_INWARD))
                 * Mat4::from_translation(-centre),
-            color: Vec4::from(scene.room.edge_color),
-            ..Default::default()
-        });
+            Vec4::from(scene.room.edge_color),
+            Vec4::ZERO,
+        ));
 
+        // wireframe shells: the body instances again, a hair larger, in the same
+        // per-shape runs
         if scene.wireframe {
-            for body in scene.bodies {
-                self.push_object(&ObjectUniforms {
-                    model: gt::model_matrix(body.pos, body.rot, body.scale * WIREFRAME_SHELL),
-                    color: Vec4::new(1.0, 1.0, 1.0, 0.32),
-                    ..Default::default()
-                });
+            let wire_base = self.instances.len() as u32;
+            for i in 0..body_total {
+                let mut shell = self.instances[body_base as usize + i];
+                let model = Mat4::from_cols_array_2d(&shell.model);
+                // Scale about the body's own centre, which is the translation column.
+                let centre = model.w_axis.truncate();
+                shell.model = (Mat4::from_translation(centre)
+                    * Mat4::from_scale(Vec3::splat(WIREFRAME_SHELL))
+                    * Mat4::from_translation(-centre)
+                    * model)
+                    .to_cols_array_2d();
+                shell.color = [1.0, 1.0, 1.0, 0.32];
+                self.instances.push(shell);
+            }
+            for (mesh, range) in &staged.bodies {
+                let shift = wire_base - body_base;
+                staged
+                    .wires
+                    .push((*mesh, range.start + shift..range.end + shift));
             }
         }
+        // the held body: one bright shell, wireframe on or off
+        if let Some(body) = scene.outlined.and_then(|i| scene.bodies.get(i)) {
+            let at = self.instances.len() as u32;
+            self.instances.push(Instance::new(
+                gt::model_matrix(body.pos, body.rot, body.scale * (WIREFRAME_SHELL + 0.01)),
+                Vec4::new(1.0, 0.95, 0.7, 0.9),
+                Vec4::ZERO,
+            ));
+            staged.wires.push((scene.shape_mesh[body.shape], at..at + 1));
+        }
 
+        let start = self.instances.len() as u32;
         for ring in scene.rings.iter() {
             let grown = ring.base_radius * (1.0 + 1.15 * ring.t);
             let to_eye = scene.eye - ring.pos;
@@ -883,39 +1373,24 @@ impl Gfx {
             let facing = ring.n.dot(to_eye).abs() / dist;
             let apparent = grown / dist;
             if facing < RING_MIN_FACING || apparent < RING_MIN_APPARENT_SIZE {
-                self.slot_offsets.push(SKIP);
                 continue;
             }
             let size_fade = (apparent / 0.09).min(1.0);
             let alpha = 0.34 * (1.0 - ring.t) * (1.0 - ring.t) * facing * size_fade;
-            self.push_object(&ObjectUniforms {
-                model: gt::disc_matrix(ring.pos, ring.n, grown, 0.006),
-                color: Vec4::new(ring.color[0], ring.color[1], ring.color[2], alpha),
-                ..Default::default()
-            });
+            self.instances.push(Instance::new(
+                gt::disc_matrix(ring.pos, ring.n, grown, 0.006),
+                Vec4::new(ring.color[0], ring.color[1], ring.color[2], alpha),
+                Vec4::ZERO,
+            ));
         }
+        staged.rings = start..self.instances.len() as u32;
 
-        // The ring buffer and its bind group have to be rebuilt together.
-        let needed = (self.object_staging.len() / UNIFORM_SLOT_BYTES).max(1);
-        if needed > self.object_slots {
-            self.object_slots = needed.next_power_of_two();
-            self.object_buffer = make_object_buffer(&self.device, self.object_slots);
-            self.object_bg =
-                make_object_bind_group(&self.device, &self.bgl_object, &self.object_buffer);
-        }
-    }
-
-    fn push_object(&mut self, uniforms: &ObjectUniforms) {
-        let offset = self.object_staging.len() as u32;
-        self.slot_offsets.push(offset);
-        self.object_staging
-            .extend_from_slice(bytemuck::bytes_of(uniforms));
-        self.object_staging
-            .resize(self.object_staging.len().next_multiple_of(UNIFORM_SLOT_BYTES), 0);
+        self.staged = staged;
     }
 }
 
-/// Byte offsets of this frame's object uniforms, in draw order.
+/// How squarely a plane at `center` with normal `n` faces `eye`: the cosine of
+/// the angle, positive when the eye is on the normal's side.
 fn facing_toward(n: Vec3, center: Vec3, eye: Vec3) -> f32 {
     let d = eye - center;
     let len = d.length();
@@ -940,31 +1415,12 @@ fn pick_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
         .unwrap_or(formats[0])
 }
 
-fn make_object_buffer(device: &wgpu::Device, slots: usize) -> wgpu::Buffer {
+fn make_vertex_buffer(device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("object uniforms"),
-        size: (slots * UNIFORM_SLOT_BYTES) as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        label: Some(label),
+        size: bytes as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    })
-}
-
-fn make_object_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffer: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("object ring"),
-        layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer,
-                offset: 0,
-                size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniforms>() as u64),
-            }),
-        }],
     })
 }
 

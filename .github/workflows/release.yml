@@ -1,0 +1,86 @@
+# Builds the app for Linux and macOS and attaches the binaries to a release.
+#
+# Runs on a version tag (`git tag v0.2.0 && git push origin v0.2.0`), or by hand
+# from the Actions tab — a manual run builds and uploads the archives as workflow
+# artifacts without creating a release.
+#
+# The tests run on the same machines first. They need no GPU: the simulation,
+# the importers and the panel layout are all checked headlessly. The render
+# probe does need one, so it stays a local check (`cargo run --bin probe`).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Only where the target is the runner's own architecture: the Intel Mac
+      # build is cross-compiled on an Apple-silicon runner and cannot run there.
+      - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin bouncing-room --bin probe
+
+      - name: Package
+        run: |
+          name="bouncing-room-${{ matrix.name }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/bouncing-room" "$name/"
+          cp "target/${{ matrix.target }}/release/probe" "$name/"
+          cp README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bouncing-room-${{ matrix.name }}
+          path: bouncing-room-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bouncing-room-*.tar.gz
+          generate_release_notes: true

@@ -29,7 +29,11 @@ impl Light {
     }
 }
 
-/// Per-frame uniforms: group 0, binding 0. 240 bytes.
+/// Per-frame uniforms: group 0, binding 0. 288 bytes.
+///
+/// The room's floor and ceiling colours live here rather than with the room's
+/// instance because they are the only per-object values an instance has no slot
+/// for, and there is only ever one room.
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FrameUniforms {
@@ -37,49 +41,58 @@ pub struct FrameUniforms {
     pub proj: Mat4,
     pub lights: [Light; LIGHT_COUNT],
     pub cam_pos: Vec4,
-}
-
-/// Per-object uniforms: group 1, binding 0. 128 bytes.
-///
-/// Interpretation depends on the pipeline, which is what lets all three
-/// pipelines share one bind group layout:
-///
-/// * `lit`: `color.rgb` is the base colour, `params = (gloss, spec strength,
-///   is room, grid spacing)`, and the two colour fields apply only to the room.
-/// * `line`: `color.rgba` is the line colour including alpha; `params` unused.
-/// * `flat`: `color.rgb` is the disc colour, `params = (alpha, inner radius)`.
-#[repr(C, align(16))]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct ObjectUniforms {
-    pub model: Mat4,
-    pub color: Vec4,
-    pub params: Vec4,
     pub floor_color: Vec4,
     pub ceil_color: Vec4,
+    /// `(near, far, strength, bias)` of the key light's shadow cube. A strength
+    /// of 0 switches shadows off in the shader.
+    pub shadow: Vec4,
 }
 
-impl Default for ObjectUniforms {
-    fn default() -> Self {
-        ObjectUniforms {
-            model: Mat4::IDENTITY,
-            color: Vec4::new(1.0, 1.0, 1.0, 1.0),
-            params: Vec4::ZERO,
-            floor_color: Vec4::ZERO,
-            ceil_color: Vec4::ZERO,
+/// One drawn thing: a body, the room, a disc, a ring. 96 bytes, read by the
+/// shaders as per-instance vertex attributes at locations 2 to 7.
+///
+/// This replaced the contract's per-object uniform block. With a uniform per
+/// body every body is its own draw call; with an instance per body, all the
+/// bodies of one shape are a single call, which is what lets the room hold
+/// thousands of them.
+///
+/// Interpretation depends on the pipeline:
+///
+/// * `lit`: `color.rgb` is the base colour and `params = (gloss, spec strength,
+///   is room, grid spacing)`.
+/// * `line`: `color.rgba` is the line colour including alpha; `params` unused.
+/// * `flat`: `color.rgb` is the disc colour, `params = (alpha, inner radius)`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Instance {
+    pub model: [[f32; 4]; 4],
+    pub color: [f32; 4],
+    pub params: [f32; 4],
+}
+
+impl Instance {
+    pub fn new(model: Mat4, color: Vec4, params: Vec4) -> Self {
+        Instance {
+            model: model.to_cols_array_2d(),
+            color: color.to_array(),
+            params: params.to_array(),
         }
     }
 }
 
-/// Uniform buffer slots must be a multiple of the device's
-/// `min_uniform_buffer_offset_alignment` to be usable with dynamic offsets, and
-/// 256 covers every backend we target. Kept as a constant so the object ring
-/// buffer and the per-draw offsets stay in step.
-pub const UNIFORM_SLOT_BYTES: usize = 256;
+/// One end of a world-space line segment with its own colour: what motion
+/// trails and impact sparks are made of. 28 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct LineVertex {
+    pub pos: [f32; 3],
+    pub color: [f32; 4],
+}
 
-const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 240);
-const _: () = assert!(std::mem::size_of::<ObjectUniforms>() == 128);
+const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 288);
+const _: () = assert!(std::mem::size_of::<Instance>() == 96);
+const _: () = assert!(std::mem::size_of::<LineVertex>() == 28);
 const _: () = assert!(std::mem::size_of::<Light>() == 32);
-const _: () = assert!(UNIFORM_SLOT_BYTES >= std::mem::size_of::<ObjectUniforms>());
 
 /// Model matrix for a body: translate, then apply the body's orthonormal
 /// rotation, then a uniform scale. Mirrors `modelMatrix()` in the WebGL build,

@@ -80,6 +80,18 @@ impl OrbitCamera {
         glam::camera::rh::proj::directx::perspective(FOV_Y, aspect, NEAR, FAR)
     }
 
+    /// The ray through a pixel: where it starts (the eye) and its unit
+    /// direction. `x` and `y` are in the same pixels as `width` and `height`,
+    /// with the origin at the top left, as the window reports the pointer.
+    pub fn ray(&self, x: f32, y: f32, width: u32, height: u32) -> (Vec3, Vec3) {
+        let ndc_x = 2.0 * x / width.max(1) as f32 - 1.0;
+        let ndc_y = 1.0 - 2.0 * y / height.max(1) as f32;
+        let inverse = (self.projection(width, height) * self.view()).inverse();
+        let near = inverse.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
+        let far = inverse.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        (self.eye(), (far - near).normalize_or(Vec3::NEG_Z))
+    }
+
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.006;
         self.pitch = (self.pitch + dy * 0.006).clamp(self.min_pitch, self.max_pitch);
@@ -137,6 +149,26 @@ impl OrbitCamera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ray_through_the_middle_of_the_window_hits_the_orbit_centre() {
+        let camera = OrbitCamera::default();
+        let (origin, dir) = camera.ray(450.0, 300.0, 900, 600);
+        assert!((origin - camera.eye()).length() < 1e-5);
+        assert!((dir.length() - 1.0).abs() < 1e-5);
+        let to_target = (camera.target - origin).normalize();
+        assert!(dir.dot(to_target) > 0.9999, "{dir:?} vs {to_target:?}");
+
+        // A pixel to the right of centre gives a ray to the camera's right, and
+        // one above centre a ray that climbs — the two signs a picker can get
+        // backwards and still look plausible.
+        let (sy, cy) = camera.yaw.sin_cos();
+        let right = Vec3::new(cy, 0.0, -sy);
+        let (_, to_the_right) = camera.ray(800.0, 300.0, 900, 600);
+        assert!(to_the_right.dot(right) > 0.1, "{to_the_right:?}");
+        let (_, upward) = camera.ray(450.0, 20.0, 900, 600);
+        assert!(upward.y > dir.y, "{upward:?} should climb more than {dir:?}");
+    }
 
     #[test]
     fn eye_sits_at_the_orbit_distance_from_the_target() {

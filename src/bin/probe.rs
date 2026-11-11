@@ -23,6 +23,8 @@ use std::path::PathBuf;
 
 use bouncing_room_native::gfx::{Disc, Gfx, GfxOptions, RenderTarget, Ring, RoomDraw, Scene};
 use bouncing_room_native::gpu_types::Light;
+use bouncing_room_native::hull::Hull;
+use bouncing_room_native::record::{self, Recorder};
 use bouncing_room_native::sim::{SpawnOpts, World};
 use bouncing_room_native::{OrbitCamera, geom, import, sim};
 
@@ -39,10 +41,15 @@ probe [options]
   --seconds S        simulated seconds before the shutter (default: 2.2)
   --front-face V     only render this room winding: cw | ccw | both (default: both)
   --keep-rings       draw impact rings (on by default; --no-rings to drop)
-  --import PATH      put an imported object (.obj or .stl) in the scene and
+  --import PATH      put an imported object (.obj, .stl, .gltf, .glb) in the scene and
                      require it to show up too; repeatable
   --wireframe    draw the edge overlay as well as the solids (the visibility
                      check reads solid pixels either way)
+  --gif S            then record S more seconds as an animated GIF beside the PNG
+  --no-hulls         imports collide as spheres instead of convex hulls
+  --primitive-hulls  cubes, cones and the other faceted primitives collide as
+                     hulls too
+  --no-shadows       the WebGL build's ground blobs instead of the shadow cube
   --hud              also render the egui overlay pass and check it composited
   --help             this text
 
@@ -94,6 +101,11 @@ const PANEL_ALPHA: f32 = 0.42;
 const PANEL_INNER: f32 = 0.45;
 const BLOB_INNER: f32 = 0.15;
 
+/// Whether the key light casts real shadows in this run. On unless
+/// `--no-shadows` asks for the WebGL build's ground blobs instead. A static
+/// rather than one more positional argument on `render`, which has plenty.
+static SHADOWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 struct Args {
     out: PathBuf,
     width: u32,
@@ -111,6 +123,12 @@ struct Args {
     /// Files to import into the scene, each of which then has to pass the same
     /// visibility check as a generated primitive.
     imports: Vec<PathBuf>,
+    /// Seconds of animation to record after the still, as a GIF; 0 for none.
+    gif: f32,
+    /// Imports collide as their bounding spheres, as they did before hulls.
+    no_hulls: bool,
+    /// The faceted primitives collide as hulls too.
+    primitive_hulls: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -126,6 +144,9 @@ fn parse_args() -> Result<Args, String> {
         hud: false,
         wireframe: false,
         imports: Vec::new(),
+        gif: 0.0,
+        no_hulls: false,
+        primitive_hulls: false,
     };
 
     let mut argv = std::env::args().skip(1);
@@ -160,7 +181,11 @@ fn parse_args() -> Result<Args, String> {
             },
             "--import" => args.imports.push(PathBuf::from(value("--import")?)),
             "--wireframe" => args.wireframe = true,
+            "--gif" => args.gif = value("--gif")?.parse().map_err(|_| "--gif: S")?,
+            "--no-hulls" => args.no_hulls = true,
+            "--primitive-hulls" => args.primitive_hulls = true,
             "--hud" => args.hud = true,
+            "--no-shadows" => SHADOWS.store(false, std::sync::atomic::Ordering::Relaxed),
             "--no-rings" => args.rings = false,
             "--keep-rings" => args.rings = true,
             "--help" | "-h" => return Err(String::new()),
@@ -267,9 +292,31 @@ fn main() {
     for import in imports.iter() {
         shapes.push(geom::ShapeDef {
             mesh: import.mesh.clone(),
-            color: [0.78, 0.8, 0.85],
-            gloss: 0.35,
+            // A mesh with colours of its own is drawn in them.
+            color: if import.mesh.colors.is_some() { [1.0; 3] } else { [0.78, 0.8, 0.85] },
+            gloss: import.gloss.unwrap_or(0.35),
         });
+    }
+    // Colliders, index-aligned with `shapes`: nothing for the built-ins unless
+    // asked, and each import's own hull unless told not to.
+    let mut colliders: Vec<Option<std::sync::Arc<Hull>>> = vec![None; geom::PRIMITIVE_NAMES.len()];
+    if args.primitive_hulls {
+        for i in [1usize, 4, 5, 6, 7, 8] {
+            let points: Vec<Vec3> = shapes[i].mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect();
+            colliders[i] = Hull::from_points(&points).map(std::sync::Arc::new);
+        }
+    }
+    for import in imports.iter() {
+        let hull = if args.no_hulls { None } else { import.hull.clone() };
+        if let Some(hull) = &hull {
+            println!(
+                "probe: {} collides as a hull of {} corners and {} faces",
+                import.source,
+                hull.verts.len(),
+                hull.planes.len()
+            );
+        }
+        colliders.push(hull.map(std::sync::Arc::new));
     }
     let mut results = Vec::new();
     let mut hud_coverage = Vec::new();
@@ -304,6 +351,7 @@ fn main() {
         // against, so a body that any wall swallowed shows up as "this pixel
         // never changed".
         let mut world = seeded_world(args.seed, args.count);
+        world.colliders = colliders.clone();
         // Imported bodies join the world under test but never the empty reference,
         // so an imported mesh that fails to draw fails for the same reason and in
         // the same terms as a body that a wall swallowed: "this pixel never
@@ -351,6 +399,44 @@ fn main() {
             args.height,
             None,
         );
+        // A clip, when asked for: the same world carried on from the still, one
+        // frame every 1/25 s of simulated time, so it is as reproducible as the
+        // PNG is. Only for the winding the renderer really uses.
+        if args.gif > 0.0 && gfx.room_front_face() == GfxOptions::default().room_front_face {
+            let path = args.out.with_extension("gif");
+            let mut recorder = Recorder::start(path.clone(), args.width, args.height)
+                .unwrap_or_else(|e| panic!("probe: --gif {e}"));
+            let mut clip_world = world.clone();
+            let frames = (args.gif * record::FPS).round() as usize;
+            for frame in 0..frames {
+                let t = args.seconds + frame as f32 / record::FPS;
+                let picture = render(
+                    &mut gfx,
+                    &shapes,
+                    &shape_mesh,
+                    room_mesh,
+                    quad_mesh,
+                    ring_mesh,
+                    &clip_world,
+                    &camera,
+                    &lights_at(t),
+                    args.rings,
+                    args.wireframe,
+                    args.width,
+                    args.height,
+                    None,
+                );
+                recorder.push(picture.pixels);
+                clip_world.step(1.0 / record::FPS);
+            }
+            let written = recorder.frames();
+            let (worker, path) = recorder.finish();
+            worker
+                .join()
+                .expect("probe: the GIF encoder panicked")
+                .unwrap_or_else(|e| panic!("probe: --gif {e}"));
+            println!("probe: wrote {written} frames to {}", path.display());
+        }
         let reference = render(
             &mut gfx,
             &shapes,
@@ -515,7 +601,16 @@ fn seeded_world(seed: u64, count: usize) -> World {
     let mut world = World::default();
     world.set_seed(seed);
     for i in 0..count {
-        world.record(i % geom::PRIMITIVE_NAMES.len(), SpawnOpts::default());
+        let pick = i % geom::PRIMITIVE_NAMES.len();
+        if count <= 60 {
+            world.record(pick, SpawnOpts::default());
+        } else {
+            // A crowd: smaller bodies, spawned in bulk and settled once. The
+            // probe's own copy of the app's rule, like its lights and colours.
+            let shrink = (60.0 / count as f32).cbrt();
+            let vary = (i as f32 * 0.618_034).fract();
+            world.spawn(pick, SpawnOpts::with_scale((0.42 + 0.36 * vary) * shrink));
+        }
     }
     world.settle();
     world
@@ -653,7 +748,10 @@ fn render(
     });
     let view = color.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let blobs = blobs_for(world, lights);
+    // Real shadows and the blobs that stand in for them are alternatives: with
+    // the shadow cube on, a blob under each body would be a second shadow.
+    let shadows = SHADOWS.load(std::sync::atomic::Ordering::Relaxed);
+    let blobs = if shadows { Vec::new() } else { blobs_for(world, lights) };
     let fixtures = panels();
     let splash = if rings { rings_for(world) } else { Vec::new() };
 
@@ -681,6 +779,9 @@ fn render(
         quad_mesh,
         ring_mesh,
         wireframe,
+        shadows,
+        lines: &[],
+        outlined: None,
     };
 
     let target = RenderTarget {
@@ -1004,13 +1105,13 @@ fn draw_hud(
                 ui.label("drag to orbit · scroll to zoom");
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.button("Pause");
-                    ui.button("Kick");
-                    ui.button("Reset");
+                    let _ = ui.button("Pause");
+                    let _ = ui.button("Kick");
+                    let _ = ui.button("Reset");
                 });
                 ui.label("space · k · r · w");
                 ui.separator();
-                ui.button("Spawn one");
+                let _ = ui.button("Spawn one");
                 ui.add(egui::Slider::new(&mut count, 1..=48));
                 ui.label("bodies");
                 ui.add(egui::Slider::new(&mut gravity, -40.0..=5.0).text("gravity"));

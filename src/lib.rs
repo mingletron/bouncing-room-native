@@ -7,15 +7,21 @@
 //!   are covered by `tests/sim_invariants.rs` with no GPU involved.
 //! * [`gfx`] is the render pass, [`gpu_types`] the CPU/GPU shared layouts,
 //!   [`camera`] the orbit camera, [`import`] geometry read in from disk.
+//! * [`hull`] is the convex-hull collider imports use, [`effects`] the trails
+//!   and sparks, and [`record`] the GIF recorder — none of which the browser
+//!   build had.
 //! * [`app`] glues them to a window: winit events, the surface, the egui HUD,
 //!   and the frame loop.
 
 pub mod app;
 pub mod camera;
+pub mod effects;
 pub mod geom;
 pub mod gfx;
 pub mod gpu_types;
+pub mod hull;
 pub mod import;
+pub mod record;
 pub mod sim;
 
 pub use camera::OrbitCamera;

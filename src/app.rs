@@ -18,17 +18,22 @@
 //!   than calling these helpers. If the scene under test and the scene being
 //!   tested were the same code, a wrong constant would cancel out in both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::camera::OrbitCamera;
+use crate::effects::Effects;
 use crate::geom::{self, ShapeDef};
 use crate::gfx::{Disc, Gfx, GfxOptions, RenderTarget, Ring, RoomDraw, Scene};
 use crate::gpu_types::Light;
+use crate::hull::Hull;
 use crate::import::{self, Import};
-use crate::sim::{self, SpawnOpts, World};
+use crate::record::{self, Recorder};
+use crate::sim::{self, Snapshot, SpawnOpts, World};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
@@ -55,6 +60,20 @@ const FRAME_STEP: f32 = 1.0 / 60.0;
 /// Most frame-steps queued at once, so key auto-repeat scrubbing cannot outrun
 /// the display with a growing backlog of simulated time.
 const MAX_QUEUED_STEPS: u32 = 8;
+
+/// Past this many generated bodies the room is a crowd: new bodies are spawned
+/// smaller, in proportion, so that a few thousand of them still fit in a room
+/// sized for a few dozen.
+const CROWD_START: usize = 60;
+/// The built-in primitives that are convex and faceted — cube, cone, cylinder,
+/// icosahedron, tetrahedron, octahedron — and so can collide as hulls when
+/// asked. The sphere and capsule are round, and the torus is not convex.
+const HULL_PRIMITIVES: [usize; 6] = [1, 4, 5, 6, 7, 8];
+/// Rewind keeps at most this many frames...
+const HISTORY_MAX_FRAMES: usize = 900;
+/// ...and at most this much memory, whichever runs out first. A room of four
+/// thousand bodies is over half a megabyte a frame.
+const HISTORY_BUDGET_BYTES: usize = 128 << 20;
 
 /// Scene colours, copied from the WebGL build's `scene` object. The probe keeps
 /// its own copy on purpose; see the module note.
@@ -130,6 +149,95 @@ struct Settings {
     /// The file being dragged over the window right now, if any: the affordance
     /// that says a drop will import rather than do nothing.
     hovered_file: Option<String>,
+    /// Real shadows from the key light. Off, the WebGL build's ground blobs
+    /// stand in for them.
+    shadows: bool,
+    trails: bool,
+    sparks: bool,
+    /// The faceted primitives collide as their actual shape instead of as
+    /// spheres. Off by default: the sphere model is the one the browser build
+    /// had, and what the seeds were tuned against.
+    primitive_hulls: bool,
+    /// What the recorder last did: "recording", where a clip was saved, or why
+    /// it could not be.
+    record_note: String,
+}
+
+/// The body the pointer is holding, and how far down the pointer's ray it is
+/// held. The distance is fixed when the body is picked up (and changed by the
+/// wheel), which is what turns a 2D pointer into a 3D position.
+#[derive(Copy, Clone, Debug)]
+struct Grab {
+    index: usize,
+    distance: f32,
+}
+
+/// The recent past, for rewinding: one snapshot of the world per simulated
+/// frame, with the accent light's clock so the lighting rewinds too.
+#[derive(Default)]
+struct History {
+    frames: VecDeque<(Snapshot, f32)>,
+    bytes: usize,
+    /// Where the room has been scrubbed back to, when it has. `None` is the
+    /// usual case: the present, at the end of `frames`.
+    cursor: Option<usize>,
+}
+
+impl History {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+        self.cursor = None;
+    }
+
+    /// The frame the room is showing.
+    fn position(&self) -> usize {
+        self.cursor.unwrap_or(self.frames.len().saturating_sub(1))
+    }
+
+    /// Add the world as it is now. If the room had been scrubbed back, the
+    /// frames after that point are a future that is no longer going to happen,
+    /// and they go first.
+    fn record(&mut self, world: &World, accent_t: f32) {
+        if let Some(at) = self.cursor.take() {
+            while self.frames.len() > at + 1 {
+                if let Some((gone, _)) = self.frames.pop_back() {
+                    self.bytes -= gone.bytes();
+                }
+            }
+        }
+        let snapshot = world.snapshot();
+        self.bytes += snapshot.bytes();
+        self.frames.push_back((snapshot, accent_t));
+        while self.frames.len() > 1
+            && (self.frames.len() > HISTORY_MAX_FRAMES || self.bytes > HISTORY_BUDGET_BYTES)
+        {
+            if let Some((gone, _)) = self.frames.pop_front() {
+                self.bytes -= gone.bytes();
+            }
+        }
+    }
+
+    /// Put the world back to frame `index`. False if there is no such frame.
+    fn seek(&mut self, index: usize, world: &mut World, accent_t: &mut f32) -> bool {
+        match self.frames.get(index) {
+            Some((snapshot, t)) => {
+                world.restore(snapshot);
+                *accent_t = *t;
+                self.cursor = Some(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Where a clip is in its life.
+enum Clip {
+    Idle,
+    Recording(Recorder),
+    /// Frames have stopped; the worker is still encoding what it was sent.
+    Saving(JoinHandle<Result<(), String>>, PathBuf),
 }
 
 /// Everything that only exists once there is a window and a device. It is one
@@ -181,6 +289,20 @@ pub struct App {
     /// Files waiting for a device: queued from the command line before there is a
     /// window, and by a drag at any time.
     pending: Vec<PathBuf>,
+    effects: Effects,
+    history: History,
+    grab: Option<Grab>,
+    clip: Clip,
+    /// The open file dialog, if one is up: it answers on this channel from its
+    /// own thread, so the room keeps animating behind it.
+    dialog: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    /// `--record S`: record a clip of this many seconds from the first frame,
+    /// then quit. `None` once the clip has been started.
+    auto_record: Option<f32>,
+    /// Set while that clip is running, to the length it should stop at.
+    auto_stop: Option<f32>,
+    /// Asked to exit; honoured by `about_to_wait`, which has the event loop.
+    quit: bool,
 
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -217,23 +339,32 @@ bouncing-room [options]
 
   --import PATH   read an object into the room once the window exists; repeatable,
                   and equivalent to dragging the file onto the window.
-                  Formats: .obj and .stl.
+                  Formats: .obj, .stl, .gltf and .glb.
+  --record S      record S seconds (at most 20) as an animated GIF, print where
+                  it was saved, and quit.
   --help, -h      this text
 
 Keys: space pause · k kick · r reset · w wireframe · . step · h hud · f fullscreen
-· c recenters · x clear all. Drag to orbit, scroll to zoom, right-drag to grab.";
+· c recenters · x clear all · , step back · o open a file · v record a clip.
+Drag to orbit, scroll to zoom, right-drag to pan. Click a body to hold it and
+let go to throw it.";
 
 /// The paths named by `--import`, in the order given. An unrecognised flag is
 /// reported and ignored rather than fatal: a stray argument from a launcher should
 /// not cost the user their window.
-fn cli_imports() -> Vec<PathBuf> {
+fn cli_args() -> (Vec<PathBuf>, Option<f32>) {
     let mut args = std::env::args().skip(1).peekable();
     let mut paths = Vec::new();
+    let mut record = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--import" => match args.next() {
                 Some(path) => paths.push(PathBuf::from(path)),
                 None => eprintln!("--import needs a path"),
+            },
+            "--record" => match args.next().and_then(|s| s.parse::<f32>().ok()) {
+                Some(seconds) if seconds > 0.0 => record = Some(seconds.min(record::MAX_SECONDS)),
+                _ => eprintln!("--record needs a number of seconds"),
             },
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -244,18 +375,19 @@ fn cli_imports() -> Vec<PathBuf> {
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
     }
-    paths
+    (paths, record)
 }
 
 /// Start the app. Called from `main`.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let imports = cli_imports();
+    let (imports, record) = cli_args();
     let event_loop = EventLoop::new()?;
     // `Wait` plus a `request_redraw` every `about_to_wait` gives a continuously
     // animating frame that is still paced by the window system, instead of the
     // busy spin `ControlFlow::Poll` gives.
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new();
+    app.auto_record = record;
     // Queued rather than imported here: there is no device yet, and registering a
     // shape needs one. The first frame that has a `Gpu` reads them.
     for path in imports {
@@ -301,6 +433,11 @@ impl App {
                 import_draft: String::new(),
                 import_note: String::new(),
                 hovered_file: None,
+                shadows: true,
+                trails: false,
+                sparks: true,
+                primitive_hulls: false,
+                record_note: String::new(),
             },
             world,
             shapes: geom::all_primitives(),
@@ -309,6 +446,14 @@ impl App {
             step_requests: 0,
             imports: Vec::new(),
             pending: Vec::new(),
+            effects: Effects::default(),
+            history: History::default(),
+            grab: None,
+            clip: Clip::Idle,
+            dialog: None,
+            auto_record: None,
+            auto_stop: None,
+            quit: false,
             window: None,
             gpu: None,
             egui_ctx,
@@ -427,9 +572,19 @@ impl App {
     /// and are not touched by it.
     fn set_count(settings: &mut Settings, world: &mut World, count: usize) {
         settings.count = count;
-        while Self::generated_count(world) < count {
-            let pick = Self::generated_count(world) % geom::PRIMITIVE_NAMES.len();
-            world.record(pick, SpawnOpts::default());
+        let mut generated = Self::generated_count(world);
+        while generated < count {
+            let pick = generated % geom::PRIMITIVE_NAMES.len();
+            if count <= CROWD_START {
+                // Spawn and settle one at a time, as the browser build did.
+                world.record(pick, SpawnOpts::default());
+            } else {
+                // A crowd is spawned in bulk and settled once at the end:
+                // settling after each of several thousand spawns is the
+                // difference between a slider and a wait.
+                world.spawn(pick, Self::crowd_opts(count, generated));
+            }
+            generated += 1;
         }
         while Self::generated_count(world) > count {
             // Remove the newest generated body rather than the tail of the list.
@@ -468,9 +623,45 @@ impl App {
         world.impacts.clear();
         world.bodies.retain(|b| !Self::is_generated(b));
         for i in 0..settings.count {
-            world.record(i % geom::PRIMITIVE_NAMES.len(), SpawnOpts::default());
+            let pick = i % geom::PRIMITIVE_NAMES.len();
+            if settings.count <= CROWD_START {
+                world.record(pick, SpawnOpts::default());
+            } else {
+                world.spawn(pick, Self::crowd_opts(settings.count, i));
+            }
         }
         world.settle();
+    }
+
+    /// How big body `i` of a crowd of `count` should be. The sizes keep the
+    /// spread the simulation would have drawn (0.42 to 0.78) and shrink together
+    /// as the cube root of the head count, which holds the total volume of the
+    /// crowd roughly steady however many there are.
+    fn crowd_opts(count: usize, i: usize) -> SpawnOpts {
+        let shrink = (CROWD_START as f32 / count.max(1) as f32).cbrt();
+        let vary = (i as f32 * 0.618_034).fract();
+        SpawnOpts::with_scale((0.42 + 0.36 * vary) * shrink)
+    }
+
+    /// Give the faceted primitives hull colliders, or take them away again.
+    fn set_primitive_hulls(world: &mut World, shapes: &[ShapeDef], on: bool) {
+        let builtins = geom::PRIMITIVE_NAMES.len();
+        if world.colliders.len() < builtins {
+            world.colliders.resize(builtins, None);
+        }
+        for i in HULL_PRIMITIVES {
+            world.colliders[i] = if on {
+                let points: Vec<glam::Vec3> = shapes[i]
+                    .mesh
+                    .vertices
+                    .iter()
+                    .map(|v| glam::Vec3::from(v.position))
+                    .collect();
+                Hull::from_points(&points).map(Arc::new)
+            } else {
+                None
+            };
+        }
     }
 
     /// Empty the room of every body, generated and imported alike, and release the
@@ -502,6 +693,7 @@ impl App {
         shapes.truncate(keep);
         shape_mesh.truncate(keep);
         world.colors.truncate(keep);
+        world.colliders.truncate(keep);
         imports.clear();
         settings.count = 0;
         settings.import_note = "cleared every body".to_owned();
@@ -546,19 +738,30 @@ impl App {
         let source = import.source.clone();
         let notes = import.notes.clone();
         let dropped = import.dropped_triangles;
+        let hull_corners = import.hull.as_ref().map(|h| h.verts.len());
 
         let shape_index = shapes.len();
         let color = IMPORT_PALETTE[imports.len() % IMPORT_PALETTE.len()];
+        // A mesh that brought its own colours (a glTF with materials) is drawn
+        // in them: the body colour multiplies the vertex colour, so it is white.
+        let body_color = if import.mesh.colors.is_some() { [1.0; 3] } else { color };
         let handle = gpu.gfx.upload_mesh(&import.mesh);
         shapes.push(ShapeDef {
             mesh: import.mesh,
-            color,
-            gloss: IMPORT_GLOSS,
+            color: body_color,
+            gloss: import.gloss.unwrap_or(IMPORT_GLOSS),
         });
         gpu.shape_mesh.push(handle);
         // The impact-ring palette is indexed by shape, so an imported body that
         // wants a sensible ring colour has to have an entry here.
         world.colors.push(color);
+        // And so is the collider list. It is allowed to be shorter than the
+        // shape table (a missing entry is a sphere), so pad it up to this shape.
+        if world.colliders.len() < shape_index {
+            world.colliders.resize(shape_index, None);
+        }
+        world.colliders.truncate(shape_index);
+        world.colliders.push(import.hull.map(Arc::new));
 
         // The fragile part of this feature: three separately-owned lists that
         // `Body::shape` indexes, which must not be allowed to drift.
@@ -608,6 +811,9 @@ impl App {
         let mut note = format!("✓ {source}: {triangles} triangles, {vertices} vertices");
         if dropped > 0 {
             note.push_str(&format!(" — {dropped} dropped by the index limit"));
+        }
+        if let Some(corners) = hull_corners {
+            note.push_str(&format!("\ncollides as a {corners}-corner hull"));
         }
         for note_extra in notes {
             note.push_str(&format!("\n{note_extra}"));
@@ -663,7 +869,11 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } if !consumed => {
-                self.dragging = true;
+                // A press on a body picks it up; a press on empty room orbits.
+                self.grab = self.pick_at_cursor();
+                self.dragging = self.grab.is_none();
+                // Either way the auto-orbit stands still while the button is
+                // down: the room should not turn under something being held.
                 self.camera.dragging = true;
             }
             // The right button grabs the room rather than the view. It does not
@@ -681,6 +891,9 @@ impl ApplicationHandler for App {
                 state: ElementState::Released,
                 ..
             } => {
+                // Letting go of a held body needs no code at all: it keeps the
+                // velocity the pointer last gave it, and that is the throw.
+                self.grab = None;
                 self.dragging = false;
                 self.camera.dragging = false;
                 self.panning = false;
@@ -706,6 +919,12 @@ impl ApplicationHandler for App {
             // [`App::dolly`] normalises both.
             WindowEvent::MouseWheel { delta, .. } if !consumed => {
                 self.dolly(delta);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // No pointer, so nothing to pick with — and a body held when the
+                // pointer leaves is let go where it is.
+                self.last_cursor = None;
+                self.grab = None;
             }
             WindowEvent::Touch(touch) if !consumed => self.on_touch(touch),
             // A file dragged over the window names itself here, which is the only
@@ -736,6 +955,7 @@ impl ApplicationHandler for App {
             // A focus loss mid-drag would otherwise leave the camera stuck to a
             // pointer that is no longer ours — grabbing the room included.
             WindowEvent::Focused(false) => {
+                self.grab = None;
                 self.dragging = false;
                 self.camera.dragging = false;
                 self.panning = false;
@@ -749,6 +969,10 @@ impl ApplicationHandler for App {
         // The room is always moving (bodies, the accent light, the auto-orbit),
         // so there is no idle state to wait for — unless the window cannot be
         // presented to at all, in which case parking is the whole point.
+        if self.quit {
+            _event_loop.exit();
+            return;
+        }
         if !self.occluded {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -802,9 +1026,27 @@ impl App {
             MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(point) => (point.y as f32 / 40.0).clamp(-4.0, 4.0),
         };
-        if units != 0.0 {
-            self.camera.dolly((-units * 0.12).exp());
+        if units == 0.0 {
+            return;
         }
+        match self.grab.as_mut() {
+            // While a body is held the wheel moves *it* along the pointer's ray,
+            // nearer or farther, rather than moving the camera.
+            Some(grab) => grab.distance = (grab.distance * (units * 0.08).exp()).clamp(1.5, 60.0),
+            None => self.camera.dolly((-units * 0.12).exp()),
+        }
+    }
+
+    /// The body under the pointer, if there is one, ready to be held.
+    fn pick_at_cursor(&self) -> Option<Grab> {
+        let (x, y) = self.last_cursor?;
+        let size = self.window.as_ref()?.inner_size();
+        let (origin, dir) = self.camera.ray(x, y, size.width, size.height);
+        let (index, _) = self.world.pick(origin, dir)?;
+        Some(Grab {
+            index,
+            distance: (self.world.bodies[index].pos - origin).dot(dir),
+        })
     }
 
     /// Accept a file for import, or say immediately why it cannot be. A format
@@ -982,6 +1224,15 @@ impl App {
             present_note,
             imports,
             pending,
+            effects,
+            history,
+            grab,
+            clip,
+            dialog,
+            last_cursor,
+            auto_record,
+            auto_stop,
+            quit,
             ..
         } = self;
         let (Some(window), Some(gpu)) = (window.clone(), gpu.as_mut()) else {
@@ -1000,17 +1251,43 @@ impl App {
         // through a wall on the next frame.
         let raw_dt = raw_dt.min(1.0 / 20.0);
 
+        // The very first frame goes into the history before anything moves, so
+        // that rewinding all the way back reaches the room as it was spawned.
+        if history.frames.is_empty() {
+            history.record(world, *accent_t);
+        }
+
+        // A held body is pulled toward the pointer before the step, so the
+        // step carries it there. A body that no longer exists is let go.
+        if let Some(held) = *grab {
+            match (*last_cursor, held.index < world.bodies.len()) {
+                (Some((x, y)), true) => {
+                    let size = window.inner_size();
+                    let (origin, dir) = camera.ray(x, y, size.width, size.height);
+                    world.hold(held.index, origin + dir * held.distance);
+                }
+                (_, false) => *grab = None,
+                _ => {}
+            }
+        }
+
+        // The one place the world advances. Each step is followed by the
+        // effects, which read what it did, and by a snapshot for rewinding.
+        let mut advance = |world: &mut World, accent_t: &mut f32, dt: f32, light_dt: f32| {
+            world.step(dt);
+            *accent_t += light_dt;
+            effects.after_step(world, dt, settings.trails, settings.sparks);
+            history.record(world, *accent_t);
+        };
         if settings.paused {
             // Scrubbing: each queued request advances exactly one frame of
             // simulated time, lights and all. Anything still queued from a
             // released pause key is dropped rather than banked up.
             for _ in 0..*step_requests {
-                world.step(FRAME_STEP);
-                *accent_t += FRAME_STEP;
+                advance(world, accent_t, FRAME_STEP, FRAME_STEP);
             }
         } else {
-            world.step(raw_dt * settings.time_scale);
-            *accent_t += raw_dt;
+            advance(world, accent_t, raw_dt * settings.time_scale, raw_dt);
         }
         *step_requests = 0;
         // The camera keeps orbiting even while the physics is paused, as in the
@@ -1033,9 +1310,6 @@ impl App {
             );
         }
 
-        let lights = App::lights_at(*accent_t);
-        let blobs = App::blobs_for(world, &lights);
-        let rings = App::rings_for(world);
         let panels = [PANEL];
 
         // --- egui ------------------------------------------------------------
@@ -1046,15 +1320,27 @@ impl App {
         // that follows.
         let raw_input = egui_state.take_egui_input(window.as_ref());
         let count_before = settings.count;
+        let hulls_before = settings.primitive_hulls;
         let mut req = HudRequests::default();
+        let extra = HudExtra {
+            history_len: history.frames.len(),
+            history_at: history.position(),
+            recording: match clip {
+                Clip::Recording(recorder) => Some(recorder.seconds()),
+                _ => None,
+            },
+            saving: matches!(clip, Clip::Saving(..)),
+            dialog_open: dialog.is_some(),
+        };
         let full_out = {
-            let (settings, world, camera, readout, req, imports) = (
+            let (settings, world, camera, readout, req, imports, extra) = (
                 &mut *settings,
                 &mut *world,
                 &mut *camera,
                 &*readout,
                 &mut req,
                 &*imports,
+                &extra,
             );
             egui_ctx.run_ui(raw_input, move |ui| {
                 hud(
@@ -1066,16 +1352,38 @@ impl App {
                     req,
                     &BODIES_RANGE,
                     imports,
+                    extra,
                 );
             })
         };
+        // Anything that replaces or reorders the bodies invalidates what points
+        // at them by index: the held body, and every trail.
+        let mut bodies_replaced = false;
         // Reset replaces the bodies but leaves the tuned gravity and bounce
         // alone, so it has to happen out here where the whole world is reachable.
         if req.reset {
             App::reset(settings, world);
+            bodies_replaced = true;
         }
         if settings.count != count_before {
             App::set_count(settings, world, settings.count);
+            bodies_replaced = true;
+        }
+        if settings.primitive_hulls != hulls_before {
+            App::set_primitive_hulls(world, shapes, settings.primitive_hulls);
+        }
+        // Rewinding. Both forms pause first: a room that is running would
+        // simply play forward again from wherever it was put.
+        let seek = match (req.scrub, req.step_back) {
+            (Some(index), _) => Some(index),
+            (None, true) => Some(history.position().saturating_sub(1)),
+            (None, false) => None,
+        };
+        if let Some(index) = seek {
+            settings.paused = true;
+            if history.seek(index, world, accent_t) {
+                bodies_replaced = true;
+            }
         }
         if req.fullscreen {
             // `Borderless(None)` is the display's own native mode. On macOS winit
@@ -1093,6 +1401,103 @@ impl App {
         }
         if req.clear {
             App::clear_all(settings, world, shapes, &mut gpu.shape_mesh, imports);
+            // The snapshots refer to shapes that have just been released.
+            history.clear();
+            if settings.primitive_hulls {
+                App::set_primitive_hulls(world, shapes, true);
+            }
+            bodies_replaced = true;
+        }
+        if bodies_replaced {
+            *grab = None;
+            effects.clear();
+        }
+
+        // The file dialog runs on a thread of its own and answers here. It is
+        // created on this thread, which macOS requires, and waited for on that
+        // one, so the room never stops drawing behind it.
+        if req.open && dialog.is_none() {
+            let (answer, receiver) = mpsc::channel();
+            let picking = rfd::AsyncFileDialog::new()
+                .set_title("Import an object")
+                .add_filter("3D objects", &import::SUPPORTED_EXTENSIONS)
+                .set_parent(window.as_ref())
+                .pick_files();
+            std::thread::spawn(move || {
+                let picked = pollster::block_on(picking).unwrap_or_default();
+                let _ = answer.send(picked.iter().map(|f| f.path().to_path_buf()).collect());
+            });
+            *dialog = Some(receiver);
+        }
+        if let Some(receiver) = dialog.as_ref() {
+            match receiver.try_recv() {
+                Ok(paths) => {
+                    for path in paths {
+                        if import::is_supported(&path) {
+                            pending.push(path);
+                        } else {
+                            settings.import_note = import::unsupported_message(&path);
+                        }
+                    }
+                    *dialog = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => *dialog = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        // `--record`: press the button once at the start and once when the
+        // clip is long enough, then leave when the file has been written.
+        if auto_record.take().is_some_and(|seconds| {
+            *auto_stop = Some(seconds);
+            true
+        }) {
+            req.record = true;
+        } else if let Some(limit) = *auto_stop {
+            match clip {
+                Clip::Recording(recorder) if recorder.seconds() >= limit => req.record = true,
+                Clip::Idle => {
+                    println!("{}", settings.record_note);
+                    *quit = true;
+                    *auto_stop = None;
+                }
+                _ => {}
+            }
+        }
+
+        // Recording: the button starts a clip and stops it, and a clip also
+        // stops itself when it has run as long as one is allowed to.
+        let stop_clip = matches!(clip, Clip::Recording(recorder) if req.record || recorder.full());
+        if stop_clip {
+            if let Clip::Recording(recorder) = std::mem::replace(clip, Clip::Idle) {
+                settings.record_note =
+                    format!("saving {} frames…", recorder.frames());
+                let (worker, path) = recorder.finish();
+                *clip = Clip::Saving(worker, path);
+            }
+        } else if req.record && matches!(clip, Clip::Idle) {
+            let size = window.inner_size();
+            let (width, height) = record::clip_size(size.width, size.height);
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            match Recorder::start(record::default_clip_path(stamp), width, height) {
+                Ok(recorder) => {
+                    settings.record_note = format!("recording {width}x{height}");
+                    *clip = Clip::Recording(recorder);
+                }
+                Err(e) => settings.record_note = format!("✗ {e}"),
+            }
+        }
+        if matches!(clip, Clip::Saving(worker, _) if worker.is_finished()) {
+            if let Clip::Saving(worker, path) = std::mem::replace(clip, Clip::Idle) {
+                settings.record_note = match worker.join() {
+                    Ok(Ok(())) => format!("✓ saved {}", path.display()),
+                    Ok(Err(e)) => format!("✗ {e}"),
+                    Err(_) => "✗ the encoder stopped unexpectedly".to_owned(),
+                };
+            }
         }
         // Imports are applied here rather than in the panel because registering
         // one needs the device, the shape table, the colour list and the world at
@@ -1192,6 +1597,17 @@ impl App {
 
         // Pass 1: the scene, into the MSAA attachment `Gfx` maintains, resolved
         // onto this frame's surface texture.
+        // Built here rather than before the HUD ran, so that a reset, a rewind
+        // or a cleared room is what this frame shows.
+        let lights = App::lights_at(*accent_t);
+        // Real shadows and the blobs that stand in for them are alternatives.
+        let blobs = if settings.shadows {
+            Vec::new()
+        } else {
+            App::blobs_for(world, &lights)
+        };
+        let rings = App::rings_for(world);
+        let lines = effects.lines(world);
         let scene = Scene {
             view: camera.view(),
             proj: camera.projection(width, height),
@@ -1216,6 +1632,9 @@ impl App {
             quad_mesh: gpu.quad_mesh,
             ring_mesh: gpu.ring_mesh,
             wireframe: settings.wireframe,
+            shadows: settings.shadows,
+            lines,
+            outlined: grab.map(|g| g.index),
         };
         gpu.gfx.render(
             &mut encoder,
@@ -1264,6 +1683,24 @@ impl App {
         window.pre_present_notify();
         gpu.gfx.queue.present(surface_texture);
 
+        // A clip frame, when one is due: the same scene again at the clip's own
+        // size, with no panel. It has to follow the submit above — both renders
+        // stage into the same buffers, and a buffer is read when its commands
+        // are submitted.
+        if let Clip::Recording(recorder) = clip {
+            if recorder.due(raw_dt) {
+                let (clip_width, clip_height) = recorder.size();
+                let clip_scene = Scene {
+                    proj: camera.projection(clip_width, clip_height),
+                    ..scene
+                };
+                match gpu.gfx.render_to_pixels(&clip_scene, clip_width, clip_height) {
+                    Ok(pixels) => recorder.push(pixels),
+                    Err(e) => settings.record_note = format!("✗ {e}"),
+                }
+            }
+        }
+
         App::drain_frees(gpu, &mut textures_delta);
         egui_state.handle_platform_output(window.as_ref(), platform_output);
     }
@@ -1273,7 +1710,7 @@ impl App {
 /// the port's own ceiling. Zero is a real setting rather than an edge case: an
 /// empty room is how you check the room itself, and both `settle` and
 /// `clamp_to_room` walk an empty `bodies` without incident.
-const BODIES_RANGE: std::ops::RangeInclusive<usize> = 0..=48;
+const BODIES_RANGE: std::ops::RangeInclusive<usize> = 0..=4000;
 
 /// What the HUD wants done but cannot do from inside its own borrow: anything
 /// that reaches past the world it is handed, such as re-seeding and rebuilding
@@ -1293,6 +1730,29 @@ struct HudRequests {
     /// Files to read. The panel cannot do this itself: an import needs the device
     /// to upload a mesh, the shape table, the colour list and the world at once.
     imports: Vec<PathBuf>,
+    /// Put the room back to this frame of the history.
+    scrub: Option<usize>,
+    /// Go back one frame from wherever the room is.
+    step_back: bool,
+    /// Bring up the file dialog. Requested because the dialog wants the window.
+    open: bool,
+    /// Start a clip, or stop the one that is running.
+    record: bool,
+}
+
+/// What the panel shows but does not own: state that lives on `App` and only
+/// needs reading here. One struct, so a new readout is a field and not another
+/// parameter on [`hud`].
+#[derive(Clone, Debug, Default)]
+struct HudExtra {
+    /// Frames of history available to rewind through, and which one is showing.
+    history_len: usize,
+    history_at: usize,
+    /// Seconds of clip recorded so far, while one is being recorded.
+    recording: Option<f32>,
+    /// A finished clip is still being written.
+    saving: bool,
+    dialog_open: bool,
 }
 
 /// Parse a seed the way the probe's `--seed` does — decimal, or hex behind `0x` —
@@ -1359,13 +1819,14 @@ fn hud(
     req: &mut HudRequests,
     bodies: &std::ops::RangeInclusive<usize>,
     imports: &[ImportedShape],
+    extra: &HudExtra,
 ) {
     // Shortcuts, read through egui so that a widget with keyboard focus keeps
     // its keys — the rule the browser build enforced by checking whether the
     // event target was an input element. The seed box is that widget now, so a
     // typed `.` or a typed `0x` stays in the box.
     if ui.memory(|m| m.focused().is_none()) {
-        let (space, k, r, w, period, h, f, c, x) = ui.input_mut(|i| {
+        let (space, k, r, w, period, h, f, c, x, comma, o, v) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::K),
@@ -1376,8 +1837,21 @@ fn hud(
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::C),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::X),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Comma),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::O),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::V),
             )
         });
+        // `,` is the other half of `.`: one frame back instead of one forward.
+        if comma {
+            req.step_back = true;
+        }
+        if o {
+            req.open = true;
+        }
+        if v {
+            req.record = true;
+        }
         if space {
             settings.paused = !settings.paused;
         }
@@ -1485,8 +1959,59 @@ fn hud(
                         camera.recenter();
                     }
                 });
-                ui.label("space · k · r · w · . step");
+                ui.label("space · k · r · w · . step · , back");
                 ui.label("h hud · f fullscreen · c recenters");
+                ui.label("o open · v record");
+                ui.label("click a body to hold it, let go to throw; the wheel pushes and pulls");
+                ui.separator();
+
+                // Rewind. The slider's right-hand end is the present; dragging
+                // it left pauses the room and puts it back to that frame, and
+                // resuming from there discards what had followed.
+                if extra.history_len > 1 {
+                    let last = extra.history_len - 1;
+                    let mut at = extra.history_at.min(last);
+                    let behind = last - at;
+                    let moved = ui
+                        .add(
+                            egui::Slider::new(&mut at, 0..=last)
+                                .show_value(false)
+                                .text(if behind == 0 {
+                                    "rewind".to_owned()
+                                } else {
+                                    format!("{behind} frames back")
+                                }),
+                        )
+                        .on_hover_text(", steps back one frame · resuming plays on from here")
+                        .changed();
+                    if moved {
+                        req.scrub = Some(at);
+                    }
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    let label = if extra.recording.is_some() { "Stop" } else { "Record" };
+                    if ui
+                        .add_enabled(!extra.saving, egui::Button::new(label))
+                        .on_hover_text("v — an animated GIF of the room, without this panel")
+                        .clicked()
+                    {
+                        req.record = true;
+                    }
+                    if let Some(seconds) = extra.recording {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("● {seconds:.1} s of {:.0}", record::MAX_SECONDS),
+                        );
+                    }
+                });
+                if !settings.record_note.is_empty() {
+                    if settings.record_note.starts_with('✗') {
+                        ui.colored_label(ui.visuals().error_fg_color, settings.record_note.as_str());
+                    } else {
+                        ui.label(settings.record_note.as_str());
+                    }
+                }
                 ui.separator();
 
                 ui.horizontal_wrapped(|ui| {
@@ -1526,8 +2051,8 @@ fn hud(
                         "used only with random size off; the sim picks 0.42-0.78 itself",
                     );
                 });
-                ui.add(egui::Slider::new(&mut settings.count, bodies.clone()))
-                    .on_hover_text("0 leaves an empty room");
+                ui.add(egui::Slider::new(&mut settings.count, bodies.clone()).logarithmic(true))
+                    .on_hover_text("0 leaves an empty room; past 60 they shrink to fit");
                 ui.label("bodies");
 
                 ui.add(
@@ -1567,7 +2092,15 @@ fn hud(
 
                 ui.separator();
                 ui.checkbox(&mut world.collide, "body collisions");
+                ui.checkbox(&mut world.hulls, "hull colliders")
+                    .on_hover_text("imported objects collide as their convex hull, not a sphere");
+                ui.checkbox(&mut settings.primitive_hulls, "…for the faceted primitives too")
+                    .on_hover_text("cubes land flat; off is the browser build's all-spheres model");
                 ui.checkbox(&mut settings.wireframe, "wireframe");
+                ui.checkbox(&mut settings.shadows, "shadows")
+                    .on_hover_text("cast from the ceiling light; off uses the ground blobs");
+                ui.checkbox(&mut settings.sparks, "sparks");
+                ui.checkbox(&mut settings.trails, "trails");
                 ui.checkbox(&mut camera.auto_orbit, "auto-orbit");
 
                 ui.separator();
@@ -1635,6 +2168,13 @@ fn hud(
                             req.imports.push(PathBuf::from(draft));
                         }
                     }
+                    if ui
+                        .add_enabled(!extra.dialog_open, egui::Button::new("Open…"))
+                        .on_hover_text("o — choose files in the system's own dialog")
+                        .clicked()
+                    {
+                        req.open = true;
+                    }
                 });
                 if let Some(hovered) = settings.hovered_file.as_deref() {
                     ui.label(format!("release to import {hovered}"));
@@ -1674,6 +2214,11 @@ mod tests {
             import_draft: String::new(),
             import_note: String::new(),
             hovered_file: None,
+            shadows: true,
+            trails: false,
+            sparks: true,
+            primitive_hulls: false,
+            record_note: String::new(),
         }
     }
 
@@ -1829,6 +2374,15 @@ mod tests {
                     &mut req,
                     &BODIES_RANGE,
                     &imports,
+                    // With history and a clip running, so the rewind slider
+                    // and the recording row are laid out too.
+                    &HudExtra {
+                        history_len: 120,
+                        history_at: 80,
+                        recording: Some(1.5),
+                        saving: false,
+                        dialog_open: false,
+                    },
                 );
             });
             assert!(
@@ -1879,6 +2433,7 @@ mod tests {
                     req,
                     &BODIES_RANGE,
                     imports,
+                    &HudExtra::default(),
                 )
             });
             // Headless: no renderer to apply the font atlas to, and
@@ -2073,5 +2628,99 @@ mod tests {
         world.settle();
         world.step(1.0 / 60.0);
         assert!(world.bodies.is_empty());
+    }
+
+    #[test]
+    fn rewinding_restores_an_earlier_frame_and_resuming_drops_the_future() {
+        let mut world = World::default();
+        world.set_seed(DEFAULT_SEED);
+        for i in 0..6 {
+            world.record(i, SpawnOpts::default());
+        }
+        let mut history = History::default();
+        let mut accent = 0.0f32;
+        history.record(&world, accent);
+        let mut positions = vec![world.bodies[0].pos];
+        for _ in 0..30 {
+            world.step(FRAME_STEP);
+            accent += FRAME_STEP;
+            history.record(&world, accent);
+            positions.push(world.bodies[0].pos);
+        }
+        assert_eq!(history.frames.len(), 31);
+        assert_eq!(history.position(), 30);
+
+        assert!(history.seek(10, &mut world, &mut accent));
+        assert_eq!(world.bodies[0].pos, positions[10], "frame 10 is frame 10 again");
+        assert!((accent - 10.0 * FRAME_STEP).abs() < 1e-5, "and the lights went back with it");
+        assert_eq!(history.position(), 10);
+        assert_eq!(history.frames.len(), 31, "scrubbing alone discards nothing");
+
+        // Playing on from frame 10 replays exactly what happened before — the
+        // generator's state is part of the snapshot — and the old frames 11..30
+        // are replaced rather than kept as a parallel future.
+        world.step(FRAME_STEP);
+        accent += FRAME_STEP;
+        history.record(&world, accent);
+        assert_eq!(history.frames.len(), 12);
+        assert_eq!(world.bodies[0].pos, positions[11]);
+        assert!(!history.seek(99, &mut world, &mut accent));
+    }
+
+    #[test]
+    fn history_stays_inside_its_frame_budget() {
+        let mut world = World::default();
+        world.spawn(0, SpawnOpts::default());
+        let mut history = History::default();
+        for _ in 0..HISTORY_MAX_FRAMES + 50 {
+            history.record(&world, 0.0);
+        }
+        assert_eq!(history.frames.len(), HISTORY_MAX_FRAMES);
+        let counted: usize = history.frames.iter().map(|(s, _)| s.bytes()).sum();
+        assert_eq!(history.bytes, counted, "the running byte count has not drifted");
+    }
+
+    #[test]
+    fn a_crowd_is_spawned_smaller_and_still_fits_the_room() {
+        let mut settings = test_settings();
+        let mut world = World::default();
+        world.set_seed(DEFAULT_SEED);
+        App::set_count(&mut settings, &mut world, 1500);
+        assert_eq!(world.bodies.len(), 1500);
+        let largest = world.bodies.iter().map(|b| b.scale).fold(0.0f32, f32::max);
+        assert!(largest < 0.3, "a crowd of 1500 is made of small bodies, got {largest}");
+        for b in &world.bodies {
+            assert!(b.pos.y >= b.radius - 1e-3 && b.pos.y <= sim::ROOM_HALF_Y - b.radius + 1e-3);
+        }
+        // And it can be simulated: a second of it leaves everything in the room.
+        for _ in 0..60 {
+            world.step(FRAME_STEP);
+        }
+        for b in &world.bodies {
+            assert!(b.pos.is_finite());
+            assert!(b.pos.x.abs() <= sim::ROOM_HALF_X + 0.05, "{:?}", b.pos);
+            assert!(b.pos.y >= -0.05 && b.pos.y <= sim::ROOM_HALF_Y + 0.05, "{:?}", b.pos);
+        }
+        // Shrinking back to a room the browser build could show still works.
+        App::set_count(&mut settings, &mut world, 9);
+        assert_eq!(world.bodies.len(), 9);
+    }
+
+    #[test]
+    fn the_faceted_primitives_get_hulls_only_when_asked() {
+        let shapes = geom::all_primitives();
+        let mut world = World::default();
+        App::set_primitive_hulls(&mut world, &shapes, true);
+        for i in HULL_PRIMITIVES {
+            assert!(world.colliders[i].is_some(), "{} has no hull", geom::PRIMITIVE_NAMES[i]);
+        }
+        // sphere, capsule, torus
+        for i in [0, 2, 3] {
+            assert!(world.colliders[i].is_none(), "{} should stay a sphere", geom::PRIMITIVE_NAMES[i]);
+        }
+        let cube = world.colliders[1].as_ref().unwrap();
+        assert_eq!((cube.verts.len(), cube.planes.len()), (8, 6));
+        App::set_primitive_hulls(&mut world, &shapes, false);
+        assert!(world.colliders.iter().all(|c| c.is_none()));
     }
 }

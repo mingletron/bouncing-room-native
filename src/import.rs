@@ -57,6 +57,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::hull::Hull;
 use crate::geom::{Mesh, Vertex};
 
 /// Largest vertex count a mesh can have and still be indexed with `u16`. The
@@ -76,7 +77,7 @@ pub const MAX_FILE_BYTES: u64 = 64 << 20;
 const WELD_QUANTUM: f32 = 1.0e-5;
 
 /// Extensions this module can read, for the HUD and for argument checking.
-pub const SUPPORTED_EXTENSIONS: [&str; 2] = ["obj", "stl"];
+pub const SUPPORTED_EXTENSIONS: [&str; 4] = ["obj", "stl", "gltf", "glb"];
 
 /// One file, read and made safe for this renderer.
 #[derive(Clone, Debug)]
@@ -93,6 +94,13 @@ pub struct Import {
     pub notes: Vec<String>,
     /// Triangles discarded by rule 3, so the note can say "of N".
     pub dropped_triangles: usize,
+    /// A convex hull around the mesh, for the simulation to collide it as. `None`
+    /// when the mesh is flat enough to enclose no volume, in which case it
+    /// collides as its bounding sphere like everything used to.
+    pub hull: Option<Hull>,
+    /// Gloss from the file's material, when the format has one (glTF). OBJ and
+    /// STL leave this `None` and the caller picks.
+    pub gloss: Option<f32>,
 }
 
 #[derive(Debug)]
@@ -114,7 +122,7 @@ impl std::fmt::Display for ImportError {
             ImportError::Io { path, reason } => write!(f, "{path}: {reason}"),
             ImportError::Unsupported { extension } => write!(
                 f,
-                "no reader for .{extension} — .obj and .stl are supported; a converter \
+                "no reader for .{extension} — .obj, .stl, .gltf and .glb are supported; a converter \
                  (Blender or assimp) can read .{extension} and write .obj"
             ),
             ImportError::Empty { source } => write!(f, "{source}: no triangles"),
@@ -143,11 +151,11 @@ pub fn is_supported(path: &Path) -> bool {
 
 /// The extensions a caller can offer the user, for a hint line.
 pub fn supported_hint() -> String {
-    SUPPORTED_EXTENSIONS
-        .iter()
-        .map(|e| format!(".{e}"))
-        .collect::<Vec<_>>()
-        .join(" or ")
+    let names: Vec<String> = SUPPORTED_EXTENSIONS.iter().map(|e| format!(".{e}")).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => names.concat(),
+    }
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -208,6 +216,13 @@ pub fn import_path(path: &Path) -> Result<Import, ImportError> {
             })?;
             parse_stl(&bytes, &source)
         }
+        "gltf" | "glb" => {
+            let bytes = std::fs::read(path).map_err(|e| ImportError::Io {
+                path: path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            parse_gltf(&bytes, path.parent(), &source)
+        }
         other => Err(ImportError::Unsupported {
             extension: other.to_owned(),
         }),
@@ -222,6 +237,11 @@ struct Raw {
     pos: Vec<[f32; 3]>,
     nrm: Vec<[f32; 3]>,
     tri: Vec<u32>,
+    /// One colour per corner, in lockstep with `pos` — or empty, for the formats
+    /// that carry no colour at all.
+    col: Vec<[u8; 4]>,
+    /// Gloss read from the file's material, if it has one.
+    gloss: Option<f32>,
 }
 
 impl Raw {
@@ -275,6 +295,210 @@ fn unit_normal(supplied: [f32; 3], flat: [f32; 3], flat_len: f32) -> [f32; 3] {
     } else {
         [0.0, 1.0, 0.0]
     }
+}
+
+// --------------------------------------------------------------------------------------
+// .gltf / .glb
+// --------------------------------------------------------------------------------------
+
+/// Decode standard base64, for a glTF whose buffers are embedded as data URIs.
+/// Hand-rolled because it is twenty lines and the alternative is a dependency.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Parse a glTF 2.0 file, text or binary. `dir` is where a `.gltf`'s external
+/// `.bin` files are looked for; `None` (a test, or a path with no parent) means
+/// only embedded buffers can be read.
+///
+/// Every mesh in the default scene merges into one body (rule 1), with each
+/// node's transform applied, so an assembly arrives assembled. What survives of
+/// its materials is their **base colour**: this renderer has no texture
+/// coordinates, so a textured model keeps each material's colour factor (and any
+/// vertex colours) and loses the image. Roughness becomes the body's gloss.
+pub fn parse_gltf(
+    bytes: &[u8],
+    dir: Option<&Path>,
+    source: &str,
+) -> Result<Import, ImportError> {
+    let bad = |reason: String| ImportError::Bad {
+        source: source.to_owned(),
+        reason,
+    };
+    let gltf = gltf::Gltf::from_slice(bytes).map_err(|e| bad(format!("not a readable glTF: {e}")))?;
+    let document = &gltf.document;
+
+    let mut buffers: Vec<Vec<u8>> = Vec::new();
+    for buffer in document.buffers() {
+        let data = match buffer.source() {
+            gltf::buffer::Source::Bin => gltf
+                .blob
+                .clone()
+                .ok_or_else(|| bad("the .glb names a binary chunk it does not contain".to_owned()))?,
+            gltf::buffer::Source::Uri(uri) => {
+                if let Some(rest) = uri.strip_prefix("data:") {
+                    let encoded = rest
+                        .split_once(";base64,")
+                        .map(|(_, data)| data)
+                        .ok_or_else(|| bad("an embedded buffer is not base64".to_owned()))?;
+                    decode_base64(encoded)
+                        .ok_or_else(|| bad("an embedded buffer is not valid base64".to_owned()))?
+                } else {
+                    let dir = dir.ok_or_else(|| {
+                        bad(format!("it refers to {uri}, and there is no folder to look in"))
+                    })?;
+                    // Only a file beside the .gltf: a URI that climbs out of the
+                    // folder or names a URL is not something to follow on the
+                    // say-so of a model file.
+                    let name = uri.replace("%20", " ");
+                    if name.contains("..") || name.contains("://") || Path::new(&name).is_absolute() {
+                        return Err(bad(format!("it refers to {uri}, which is outside its own folder")));
+                    }
+                    let path = dir.join(&name);
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if size > MAX_FILE_BYTES {
+                        return Err(bad(format!("its buffer {uri} is over the input limit")));
+                    }
+                    std::fs::read(&path).map_err(|e| ImportError::Io {
+                        path: path.display().to_string(),
+                        reason: e.to_string(),
+                    })?
+                }
+            }
+        };
+        if (data.len() as u64) < buffer.length() as u64 {
+            return Err(bad("a buffer is shorter than the file says it is".to_owned()));
+        }
+        buffers.push(data);
+    }
+
+    let mut raw = Raw::default();
+    let mut glosses: Vec<f32> = Vec::new();
+    let mut textured = 0usize;
+    let mut skipped_modes = 0usize;
+
+    // Walk the default scene (or the first, or failing that every root node),
+    // carrying each node's world transform down to its mesh.
+    let roots: Vec<gltf::Node> = match document.default_scene().or_else(|| document.scenes().next()) {
+        Some(scene) => scene.nodes().collect(),
+        None => document.nodes().collect(),
+    };
+    let mut stack: Vec<(gltf::Node, glam::Mat4)> =
+        roots.into_iter().map(|n| (n, glam::Mat4::IDENTITY)).collect();
+    let mut visited = 0usize;
+    while let Some((node, parent)) = stack.pop() {
+        visited += 1;
+        if visited > 100_000 {
+            return Err(bad("its node graph does not end".to_owned()));
+        }
+        let world = parent * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
+        for child in node.children() {
+            stack.push((child, world));
+        }
+        let Some(mesh) = node.mesh() else { continue };
+        // Normals transform by the inverse transpose, which matters as soon as a
+        // node is scaled unevenly.
+        let normal_matrix = glam::Mat3::from_mat4(world).inverse().transpose();
+        for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                skipped_modes += 1;
+                continue;
+            }
+            let reader = primitive.reader(|b| buffers.get(b.index()).map(Vec::as_slice));
+            let Some(positions) = reader.read_positions() else { continue };
+            let positions: Vec<[f32; 3]> = positions.collect();
+            let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|n| n.collect());
+            let vertex_colors: Option<Vec<[f32; 4]>> =
+                reader.read_colors(0).map(|c| c.into_rgba_f32().collect());
+            let indices: Vec<u32> = match reader.read_indices() {
+                Some(indices) => indices.into_u32().collect(),
+                None => (0..positions.len() as u32).collect(),
+            };
+
+            let material = primitive.material();
+            let pbr = material.pbr_metallic_roughness();
+            let base = pbr.base_color_factor();
+            if pbr.base_color_texture().is_some() {
+                textured += 1;
+            }
+            // Smooth materials shine: roughness 0 is a tight highlight, 1 a
+            // broad dull one, on the same scale the built-in primitives use.
+            glosses.push(8.0 + (1.0 - pbr.roughness_factor().clamp(0.0, 1.0)).powi(2) * 88.0);
+
+            let start = raw.pos.len() as u32;
+            for (i, p) in positions.iter().enumerate() {
+                let p = world.transform_point3(glam::Vec3::from(*p));
+                raw.pos.push(p.to_array());
+                let n = normals
+                    .as_ref()
+                    .and_then(|n| n.get(i))
+                    .map(|n| (normal_matrix * glam::Vec3::from(*n)).normalize_or_zero())
+                    .unwrap_or(glam::Vec3::ZERO);
+                raw.nrm.push(n.to_array());
+                let v = vertex_colors.as_ref().and_then(|c| c.get(i)).copied().unwrap_or([1.0; 4]);
+                // The lit shader works in display-referred values, and glTF
+                // colours are linear, so they are encoded on the way in.
+                let encode = |linear: f32| (linear.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+                raw.col.push([
+                    encode(base[0] * v[0]),
+                    encode(base[1] * v[1]),
+                    encode(base[2] * v[2]),
+                    255,
+                ]);
+            }
+            let count = positions.len() as u32;
+            // A mirrored node flips the winding; putting it back keeps the flat
+            // normals `finish` may have to rebuild pointing outward.
+            let mirrored = world.determinant() < 0.0;
+            for tri in indices.chunks_exact(3) {
+                if tri.iter().any(|&i| i >= count) {
+                    continue;
+                }
+                let (a, b, c) = (start + tri[0], start + tri[1], start + tri[2]);
+                if mirrored {
+                    raw.tri.extend_from_slice(&[a, c, b]);
+                } else {
+                    raw.tri.extend_from_slice(&[a, b, c]);
+                }
+            }
+        }
+    }
+
+    if !glosses.is_empty() {
+        raw.gloss = Some(glosses.iter().sum::<f32>() / glosses.len() as f32);
+    }
+    let mut import = finish(raw, source)?;
+    if textured > 0 {
+        import.notes.push(format!(
+            "{textured} textured material(s) kept their base colour only — this renderer has no              texture coordinates"
+        ));
+    }
+    if skipped_modes > 0 {
+        import.notes.push(format!(
+            "{skipped_modes} primitive(s) were points, lines or strips and are not drawn"
+        ));
+    }
+    Ok(import)
 }
 
 // --------------------------------------------------------------------------------------
@@ -611,7 +835,12 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
     // hairline seam in a wireframe, whereas an exact float compare guarantees
     // seams everywhere.
     let mut welded: Vec<Vertex> = Vec::new();
-    let mut keys: HashMap<([i64; 3], [i64; 3]), u16> = HashMap::new();
+    // Colour joins the key when the file has any: two corners that agree on
+    // position and normal but sit on differently coloured faces are a material
+    // boundary, and welding across it would smear one colour into the other.
+    let colored = !raw.col.is_empty() && raw.col.len() == raw.pos.len();
+    let mut welded_colors: Vec<[u8; 4]> = Vec::new();
+    let mut keys: HashMap<([i64; 3], [i64; 3], [u8; 4]), u16> = HashMap::new();
     let mut indices: Vec<u16> = Vec::with_capacity(raw.tri.len());
     let mut dropped_degenerate = 0usize;
     let mut rebuilt_normals = 0usize;
@@ -650,6 +879,7 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
         considered_corners += 3;
         let mut face = [[0.0f32; 3]; 3];
         let mut supplied = [[0.0f32; 3]; 3];
+        let mut tint = [[255u8; 4]; 3];
         let mut usable = true;
         for c in 0..3 {
             let slot = raw.tri[t * 3 + c] as usize;
@@ -664,6 +894,9 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
                 ((p[2] as f64 - centre[2]) * scale) as f32,
             ];
             supplied[c] = raw.nrm[slot];
+            if colored {
+                tint[c] = raw.col[slot];
+            }
         }
         if !usable {
             dropped_degenerate += 1;
@@ -700,6 +933,7 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
             let key = (
                 [quant(face[c][0]), quant(face[c][1]), quant(face[c][2])],
                 [quant(n[0]), quant(n[1]), quant(n[2])],
+                tint[c],
             );
             corner_idx[c] = match keys.get(&key) {
                 Some(existing) => *existing,
@@ -709,6 +943,7 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
                         position: face[c],
                         normal: n,
                     });
+                    welded_colors.push(tint[c]);
                     keys.insert(key, fresh);
                     fresh
                 }
@@ -796,6 +1031,14 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
         ));
     }
 
+    // The collider: a hull around what is actually drawn, so a sampled mesh and
+    // its collider still agree.
+    let points: Vec<glam::Vec3> = welded.iter().map(|v| glam::Vec3::from(v.position)).collect();
+    let hull = Hull::from_points(&points);
+    if hull.is_none() {
+        notes.push("too flat to enclose a volume, so it collides as a sphere".to_owned());
+    }
+
     Ok(Import {
         mesh: Mesh {
             // Every built-in mesh names itself; an import cannot carry its file
@@ -805,10 +1048,13 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
             vertices: welded,
             indices: Some(indices),
             edges,
+            colors: colored.then_some(welded_colors),
         },
         source: source.to_owned(),
         notes,
         dropped_triangles: sampled_out,
+        hull,
+        gloss: raw.gloss,
     })
 }
 
@@ -1358,7 +1604,7 @@ f 1 4 6
         }
         assert!(is_supported(Path::new("a/b/c.OBJ")));
         assert!(is_supported(Path::new("c.stl")));
-        assert_eq!(supported_hint(), ".obj or .stl");
+        assert_eq!(supported_hint(), ".obj, .stl, .gltf or .glb");
     }
 
     #[test]

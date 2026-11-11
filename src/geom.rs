@@ -45,6 +45,10 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Option<Vec<u16>>,
     pub edges: Vec<u16>,
+    /// One RGBA colour per vertex, multiplied into the body's own colour.
+    /// `None` is white throughout, which is every mesh generated here; only a
+    /// glTF import, which can carry several materials in one object, fills it.
+    pub colors: Option<Vec<[u8; 4]>>,
 }
 
 impl Mesh {
@@ -254,6 +258,7 @@ fn make_mesh(name: &'static str, b: Builder, normalize: bool) -> Mesh {
         } else {
             Some(b.idx.iter().map(|&i| i as u16).collect())
         },
+        colors: None,
         edges,
     }
 }
