@@ -35,10 +35,13 @@
 //!    sphere, so splitting an assembly into one body per part would make its
 //!    parts bounce apart from each other, which is worse than coarse.
 //! 2. **Normalised to a unit bounding radius**, the convention
-//!    `docs/PORT_CONTRACT.md` sets for every primitive. That makes the sim's
-//!    collision radius for an import exactly its bounding sphere, and lets an
-//!    asset authored in metres, millimetres or inches join the room at a sane
-//!    size — the file's units are never trusted, only its proportions.
+//!    `docs/PORT_CONTRACT.md` sets for every primitive, and measured the same way:
+//!    the farthest *vertex* from the centre, not the corner of a bounding box no
+//!    vertex may reach. That makes the sim's collision radius for an import
+//!    exactly its bounding sphere rather than a slight oversize — an oversize
+//!    would leave the drawn mesh floating off the walls its collider hits. It also
+//!    lets an asset authored in metres, millimetres or inches join the room at a
+//!    sane size: the file's units are never trusted, only its proportions.
 //! 3. **Inside the renderer's index budget.** [`Mesh::indices`] is a `Vec<u16>`
 //!    and `Gfx::upload_mesh` writes 16-bit index buffers, so a mesh larger than
 //!    ~65k vertices cannot be drawn without changing the vertex format for every
@@ -564,12 +567,27 @@ fn finish(raw: Raw, source: &str) -> Result<Import, ImportError> {
         (lo[1] + hi[1]) * 0.5,
         (lo[2] + hi[2]) * 0.5,
     ];
-    let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
-    // The bounding *radius*, not the half-extent: `Mesh::max_radius` measures
-    // vertex distance from the origin, and the sphere has to reach the corner of
-    // the box, which is half the diagonal.
-    let radius =
-        (extent[0] * extent[0] + extent[1] * extent[1] + extent[2] * extent[2]).sqrt() * 0.5;
+    // The contract's invariant, measured the way the contract measures it:
+    // `Mesh::max_radius` is the farthest *vertex* from the origin, and every
+    // built-in primitive is built so that it is exactly 1.0. Normalising by the
+    // bounding box's diagonal instead is a guess at that number — the diagonal
+    // reaches a corner of the box that no vertex of an irregular model need occupy
+    // — and it leaves the sphere a few percent bigger than the mesh. On a
+    // five-sided spike that measured 1.6%: the collider touched the floor while the
+    // picture floated above it. So the radius here is the true tight bounding
+    // sphere about the box centre, which is what makes `radius_factor = 1.0` exact
+    // rather than merely close.
+    let radius = raw
+        .pos
+        .iter()
+        .filter(|p| finite(**p))
+        .map(|p| {
+            let dx = p[0] as f64 - centre[0];
+            let dy = p[1] as f64 - centre[1];
+            let dz = p[2] as f64 - centre[2];
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        })
+        .fold(0.0f64, f64::max);
     if !(radius > 1.0e-9) {
         return Err(ImportError::Bad {
             source: source.to_owned(),
@@ -988,6 +1006,40 @@ f -3/1 -2/2 -1/3
                 .iter()
                 .any(|n| n.contains("degenerate or non-finite"))
         );
+        assert_import_is_sane(&import);
+    }
+
+    #[test]
+    fn the_unit_radius_is_the_farthest_vertex_not_the_corner_of_the_bounding_box() {
+        // Six vertices on the axes: the box around them is [-1,1]³, so half its
+        // diagonal is 1.73 — a corner that no vertex of this shape occupies.
+        // Normalising by that (which is what this used to do) leaves `max_radius`
+        // at 0.58 and the mesh a hair under two thirds the size its collider
+        // claims. The contract's number is the vertex distance, so that is what
+        // goes to 1.0.
+        let text = "\
+v  1 0 0
+v  0 1 0
+v -1 0 0
+v  0 -1 0
+v  0 0 1
+v  0 0 -1
+f 1 2 5
+f 2 3 5
+f 3 4 5
+f 4 1 5
+f 2 1 6
+f 3 2 6
+f 4 3 6
+f 1 4 6
+";
+        let import = parse_obj(text, "octahedron").expect("an eight-face shell parses");
+        let radius = import.mesh.max_radius();
+        assert!(
+            (radius - 1.0).abs() < 1.0e-4,
+            "max_radius should normalise to 1.0, got {radius}"
+        );
+        assert_eq!(import.mesh.triangle_count(), 8);
         assert_import_is_sane(&import);
     }
 
