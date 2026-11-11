@@ -1,0 +1,3 @@
+# Cargo build output. Not anchored, so it also covers `scratch-sim/target`,
+# which is a second workspace's build directory rather than the root crate's.
+target/

@@ -1,0 +1,36 @@
+[package]
+name = "bouncing-room-native"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bouncing_room_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bouncing-room"
+path = "src/main.rs"
+
+# The offscreen render probe: renders a frame headlessly, writes a PNG, and
+# checks that the bodies inside the room are actually visible (see the note on
+# `GfxOptions::room_front_face`).
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+# `default_fonts` must be requested explicitly: egui 0.37's `default` feature is
+# empty and it depends on epaint with `default-features = false`, so without this
+# the font atlas has no glyphs and every character draws as the missing-glyph box.
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = "0.37.0"
+egui-winit = "0.37.0"
+glam = { version = "0.34.3", features = ["bytemuck"] }
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+# Used by the offscreen render probe (src/bin/probe.rs) so the native port can
+# be checked the way the browser probe checks the WebGL build.
+png = "0.18.1"
