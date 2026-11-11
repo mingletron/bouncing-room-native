@@ -2,6 +2,8 @@
 name = "bouncing-room-native"
 version = "0.1.0"
 edition = "2024"
+# Two binaries live here; plain `cargo run` means the app, not the probe.
+default-run = "bouncing-room"
 
 [lib]
 name = "bouncing_room_native"
