@@ -32,7 +32,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 /// Bodies in the room at startup, as in the browser build.
 const INITIAL_COUNT: usize = 14;
@@ -87,6 +87,16 @@ struct Settings {
     /// whatever the user has typed, and only a successful parse reaches `seed` —
     /// an unparsable box must not be able to change the world.
     seed_text: String,
+    /// The whole egui overlay is off, which is how a clean picture of the room
+    /// gets made. `h` is the way back, and it still works with nothing painted —
+    /// see the note in [`hud`] about where that check sits.
+    hud_hidden: bool,
+    /// Which primitive the next "Spawn one" adds.
+    spawn_shape: usize,
+    /// How big that one is — unless `spawn_random` leaves it to the sim, which
+    /// draws its own scale from 0.42 to 0.78.
+    spawn_size: f32,
+    spawn_random: bool,
 }
 
 /// Everything that only exists once there is a window and a device. It is one
@@ -134,6 +144,8 @@ pub struct App {
     /// Orbit-camera pointer state. egui claims a press on one of its widgets
     /// before we see it, so a slider drag never also spins the room.
     dragging: bool,
+    /// Set while the right button holds the orbit centre to the pointer.
+    panning: bool,
     last_cursor: Option<(f32, f32)>,
     touches: HashMap<u64, (f32, f32)>,
     pinch_span: Option<f32>,
@@ -184,6 +196,13 @@ impl App {
                 // Hex, because the seed box is also how a layout gets handed to
                 // `probe --seed`, and that flag reads a `0x` prefix as hex.
                 seed_text: format!("{DEFAULT_SEED:#x}"),
+                hud_hidden: false,
+                // The starting room cycles through the primitives in order, so
+                // the picker opens on the one that spawn would add next and the
+                // first click continues the cycle instead of breaking it.
+                spawn_shape: INITIAL_COUNT % geom::PRIMITIVE_NAMES.len(),
+                spawn_size: 0.55,
+                spawn_random: true,
             },
             world,
             shapes: geom::all_primitives(),
@@ -200,6 +219,7 @@ impl App {
             readout: "booting…".to_owned(),
             adapter_label: String::new(),
             dragging: false,
+            panning: false,
             last_cursor: None,
             touches: HashMap::new(),
             pinch_span: None,
@@ -369,18 +389,37 @@ impl ApplicationHandler for App {
                 self.dragging = true;
                 self.camera.dragging = true;
             }
+            // The right button grabs the room rather than the view. It does not
+            // set `camera.dragging`, because auto-orbit around a point you have
+            // just chosen is a feature rather than a fight — switching it off is
+            // the HUD's checkbox, not a side effect of a drag.
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if !consumed => {
+                self.panning = true;
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 ..
             } => {
                 self.dragging = false;
                 self.camera.dragging = false;
+                self.panning = false;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = (position.x as f32, position.y as f32);
                 if let Some((lx, ly)) = self.last_cursor.take() {
                     if self.dragging {
                         self.camera.orbit(x - lx, y - ly);
+                    } else if self.panning {
+                        // Read before the pan: `units_per_pixel` looks at the
+                        // camera's distance, and the pan is about to change the
+                        // camera.
+                        let upp = self.units_per_pixel();
+                        self.camera.pan(x - lx, y - ly, upp);
+                        App::clamp_target(&mut self.camera);
                     }
                 }
                 self.last_cursor = Some((x, y));
@@ -401,10 +440,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => self.draw(),
             // A focus loss mid-drag would otherwise leave the camera stuck to a
-            // pointer that is no longer ours.
+            // pointer that is no longer ours — grabbing the room included.
             WindowEvent::Focused(false) => {
                 self.dragging = false;
                 self.camera.dragging = false;
+                self.panning = false;
                 self.last_cursor = None;
             }
             _ => {}
@@ -471,6 +511,32 @@ impl App {
         if units != 0.0 {
             self.camera.dolly((-units * 0.12).exp());
         }
+    }
+
+    /// How many world units one vertical pixel spans at the current orbit
+    /// distance, which is what makes a right-drag grab feel like a grab at both
+    /// zoom limits: the room is `2 * distance * tan(fov/2)` units tall on screen.
+    fn units_per_pixel(&self) -> f32 {
+        let height = self
+            .window
+            .as_ref()
+            .map_or(600.0, |w| w.inner_size().height.max(1) as f32);
+        (2.0 * self.camera.distance * (crate::camera::FOV_Y * 0.5).tan()) / height
+    }
+
+    /// Keep the orbit centre inside the room.
+    ///
+    /// An unbounded pan slides the target off to somewhere no picture shows, after
+    /// which orbiting sweeps the camera through a huge arc around a point nobody
+    /// can see. The room box is the honest limit — everything worth looking at is
+    /// inside it, and the interior-culling trick already lets the camera sit
+    /// outside the walls — and it is applied here rather than in `camera.rs`
+    /// because the room's own constants live in `sim`.
+    fn clamp_target(camera: &mut OrbitCamera) {
+        let (hx, hy, hz) = (sim::ROOM_HALF_X, sim::ROOM_HALF_Y, sim::ROOM_HALF_Z);
+        camera.target = camera
+            .target
+            .clamp(glam::Vec3::new(-hx, 0.0, -hz), glam::Vec3::new(hx, hy, hz));
     }
 
     /// One-finger drag orbits; two fingers pinch to dolly. The browser build's
@@ -692,6 +758,18 @@ impl App {
         if settings.count != count_before {
             App::set_count(settings, world, settings.count);
         }
+        if req.fullscreen {
+            // `Borderless(None)` is the display's own native mode, and on macOS
+            // winit gives the window a full-screen space of its own rather than
+            // covering the desktop — which is what a viewer like this wants. The
+            // size change arrives as a `Resized` event, so `on_resize` reconfigures
+            // the surface and `Gfx` rebuilds its attachments on the next frame.
+            if window.fullscreen().is_some() {
+                window.set_fullscreen(None);
+            } else {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            }
+        }
         // Frame-steps are asked for here and paid by the *next* frame's physics
         // block, which is what keeps a scrubbed step exactly FRAME_STEP long.
         if req.steps > 0 {
@@ -871,6 +949,9 @@ const BODIES_RANGE: std::ops::RangeInclusive<usize> = 0..=48;
 struct HudRequests {
     reset: bool,
     steps: u32,
+    /// Flip full screen. Asked for rather than done because the window belongs to
+    /// `App`, not to the panel, and winit wants the call on the event-loop thread.
+    fullscreen: bool,
 }
 
 /// Parse a seed the way the probe's `--seed` does — decimal, or hex behind `0x` —
@@ -942,13 +1023,16 @@ fn hud(
     // event target was an input element. The seed box is that widget now, so a
     // typed `.` or a typed `0x` stays in the box.
     if ui.memory(|m| m.focused().is_none()) {
-        let (space, k, r, w, period) = ui.input_mut(|i| {
+        let (space, k, r, w, period, h, f, c) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::K),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::R),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::W),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Period),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::H),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::F),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::C),
             )
         });
         if space {
@@ -969,6 +1053,25 @@ fn hud(
         if period {
             request_step(settings, req);
         }
+        if h {
+            settings.hud_hidden = !settings.hud_hidden;
+        }
+        if f {
+            req.fullscreen = true;
+        }
+        // Recentring needs no request: the panel is handed the camera already, and
+        // unlike a reset this touches nothing outside it.
+        if c {
+            camera.recenter();
+        }
+    }
+
+    // Both panels are the entire overlay, so hiding them is what makes a clean
+    // picture of the room possible. Note where this sits: the shortcuts above are
+    // read first and still work on a frame with no panel on screen, which is the
+    // only reason `h` is a way back and not a trap.
+    if settings.hud_hidden {
+        return;
     }
 
     egui::Panel::bottom("readout").show(ui, |ui| {
@@ -985,7 +1088,7 @@ fn hud(
             // camera.
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Bouncing room");
-                ui.label("drag to orbit · scroll to zoom");
+                ui.label("drag to orbit · scroll to zoom · right-drag grabs the room");
                 ui.separator();
 
                 let pause_label = if settings.paused { "Resume" } else { "Pause" };
@@ -1008,15 +1111,61 @@ fn hud(
                     {
                         request_step(settings, req);
                     }
+                    if ui
+                        .button("Hide")
+                        .on_hover_text("h — the panel is gone until you press h again")
+                        .clicked()
+                    {
+                        settings.hud_hidden = true;
+                    }
+                });
+                // A second button row for the two things that are not simulation
+                // controls at all: the window, and where the camera is looking.
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Fullscreen")
+                        .on_hover_text("f — the display's own native mode")
+                        .clicked()
+                    {
+                        req.fullscreen = true;
+                    }
+                    if ui
+                        .button("Recenter")
+                        .on_hover_text("c — back to the opening framing; auto-orbit keeps its setting")
+                        .clicked()
+                    {
+                        camera.recenter();
+                    }
                 });
                 ui.label("space · k · r · w · . step");
+                ui.label("h hud · f fullscreen · c recenters");
                 ui.separator();
 
                 if ui.button("Spawn one").clicked() {
-                    let pick = world.bodies.len() % geom::PRIMITIVE_NAMES.len();
-                    world.record(pick, SpawnOpts::default());
+                    let opts = if settings.spawn_random {
+                        SpawnOpts::default()
+                    } else {
+                        SpawnOpts::with_scale(settings.spawn_size)
+                    };
+                    world.record(settings.spawn_shape, opts);
                     settings.count = world.bodies.len();
                 }
+                // Nine one-word buttons rather than a dropdown: the primitives are
+                // the subject of the app, and seeing which one is armed is most of
+                // the point. `SpawnOpts::with_scale` has existed in the simulation
+                // since it was ported and nothing outside its own tests called it
+                // until this row.
+                ui.horizontal_wrapped(|ui| {
+                    for (i, name) in geom::PRIMITIVE_NAMES.iter().enumerate() {
+                        ui.selectable_value(&mut settings.spawn_shape, i, *name);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut settings.spawn_random, "random size");
+                    ui.add(egui::Slider::new(&mut settings.spawn_size, 0.3..=1.0)).on_hover_text(
+                        "used only with random size off; the sim picks 0.42-0.78 itself",
+                    );
+                });
                 ui.add(egui::Slider::new(&mut settings.count, bodies.clone()))
                     .on_hover_text("0 leaves an empty room");
                 ui.label("bodies");
@@ -1114,6 +1263,10 @@ mod tests {
             count: 5,
             seed: DEFAULT_SEED,
             seed_text: format!("{DEFAULT_SEED:#x}"),
+            hud_hidden: false,
+            spawn_shape: 0,
+            spawn_size: 0.55,
+            spawn_random: true,
         }
     }
 
@@ -1256,6 +1409,103 @@ mod tests {
             // `clear` is the sanctioned way out of a headless one.
             out.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn a_hidden_hud_is_a_clean_picture_and_still_answers_h() {
+        // Three frames: hidden, un-hidden by a key event, visible again. The
+        // middle one is the point — hiding the panel has to be reversible from the
+        // keyboard alone, which it is because the shortcuts are read before the
+        // early return in `hud`. Move that return above the shortcut block and this
+        // is the test that says why.
+        // A nested fn rather than a closure, because each frame needs exclusive
+        // use of the settings it is asserting on between calls.
+        fn frame(
+            ctx: &egui::Context,
+            settings: &mut Settings,
+            world: &mut World,
+            camera: &mut OrbitCamera,
+            req: &mut HudRequests,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let mut input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            ));
+            let mut out = ctx.run_ui(input, |ui| {
+                hud(
+                    ui,
+                    settings,
+                    world,
+                    camera,
+                    "60 fps · 5 bodies",
+                    req,
+                    &BODIES_RANGE,
+                )
+            });
+            // Headless: no renderer to apply the font atlas to, and
+            // `TexturesDelta` debug-asserts if it is dropped with work pending.
+            out.textures_delta.clear();
+            out
+        }
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut settings = test_settings();
+        let mut world = World::default();
+        let mut camera = OrbitCamera::default();
+        let mut req = HudRequests::default();
+
+        settings.hud_hidden = true;
+        let hidden = frame(&ctx, &mut settings, &mut world, &mut camera, &mut req, vec![]);
+        assert!(
+            hidden.shapes.is_empty(),
+            "a hidden HUD painted {} shapes, so the picture is not clean",
+            hidden.shapes.len()
+        );
+
+        let key = |pressed: bool| egui::Event::Key {
+            key: egui::Key::H,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &mut settings,
+            &mut world,
+            &mut camera,
+            &mut req,
+            vec![key(true), key(false)],
+        );
+        assert!(!settings.hud_hidden, "`h` must bring the panel back");
+
+        let shown = frame(&ctx, &mut settings, &mut world, &mut camera, &mut req, vec![]);
+        assert!(!shown.shapes.is_empty(), "the panel should paint again");
+    }
+
+    #[test]
+    fn a_pan_cannot_slide_the_orbit_centre_out_of_the_room() {
+        let mut camera = OrbitCamera::default();
+        for _ in 0..40 {
+            camera.pan(400.0, -400.0, 0.2);
+            App::clamp_target(&mut camera);
+        }
+        let t = camera.target;
+        assert!(
+            t.x.abs() <= sim::ROOM_HALF_X
+                && t.z.abs() <= sim::ROOM_HALF_Z
+                && (0.0..=sim::ROOM_HALF_Y).contains(&t.y),
+            "the orbit centre escaped the room: {t:?}"
+        );
+
+        camera.recenter();
+        assert_eq!(camera.target, OrbitCamera::default().target);
     }
 
     #[test]

@@ -1,5 +1,11 @@
 //! Orbit camera: a port of `src/controls.js`, minus the DOM.
 //!
+//! Panning the orbit centre is the one thing here the browser build did not have:
+//! `controls.js` could only orbit and dolly, so a pile that drifted into a corner
+//! could not be followed. [`OrbitCamera::pan`] is the port's own addition, and
+//! the room clamping that keeps it sane lives in `app.rs` next to the room
+//! constants.
+//!
 //! The pointer/wheel plumbing lives in `app.rs`; everything here is pure math,
 //! which is what lets it be unit tested without a window. Pitch is clamped so
 //! the up vector never flips when the camera passes over the room, and the
@@ -81,6 +87,44 @@ impl OrbitCamera {
 
     pub fn dolly(&mut self, factor: f32) {
         self.distance = (self.distance * factor).clamp(self.min_distance, self.max_distance);
+    }
+
+    /// Slide the orbit centre across the screen: a right-drag grabs the room and
+    /// the room follows the pointer.
+    ///
+    /// `units_per_pixel` is what one pixel of drag is worth in world units, which
+    /// only the caller knows — it depends on the window height, the field of view
+    /// and how far the camera currently is. Getting that from the caller is what
+    /// makes a grab still feel like a grab at both zoom limits.
+    ///
+    /// Only `target` moves: yaw, pitch and distance are untouched, so a pan is
+    /// not a sneaky orbit and never dollies the camera in or out.
+    pub fn pan(&mut self, dx: f32, dy: f32, units_per_pixel: f32) {
+        // The two in-plane basis vectors, straight from yaw and pitch rather than
+        // out of the view matrix: `right` is the camera's x axis in world space,
+        // and `up` is perpendicular to that and to the forward direction. Both are
+        // unit length at any pitch the clamps allow, so no normalising needed.
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        let right = Vec3::new(cy, 0.0, -sy);
+        let up = Vec3::new(-sy * sp, cp, -cy * sp);
+
+        // Dragging right moves the room right, which means the camera — and with
+        // it the point it is orbiting — moves left. Same logic downward.
+        self.target += up * (dy * units_per_pixel) - right * (dx * units_per_pixel);
+    }
+
+    /// Restore the opening framing without touching anything the HUD owns.
+    ///
+    /// `auto_orbit` and `auto_speed` are deliberately left alone: a recenter that
+    /// silently re-armed (or killed) the auto-orbit checkbox would be a settings
+    /// change nobody asked for.
+    pub fn recenter(&mut self) {
+        let default = OrbitCamera::default();
+        self.yaw = default.yaw;
+        self.pitch = default.pitch;
+        self.distance = default.distance;
+        self.target = default.target;
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -166,6 +210,112 @@ mod tests {
             cam.dolly(2.0);
         }
         assert!((cam.distance - cam.max_distance).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_right_drag_grabs_the_room_and_it_follows_the_pointer() {
+        // The target itself is always at the screen centre, so the claim that the
+        // room moved with the pointer has to be read off some other world point.
+        let mut cam = OrbitCamera::default();
+        let probe = Vec3::new(1.0, 2.0, -3.0);
+        let on_screen = |cam: &OrbitCamera| cam.view().transform_point3(probe);
+
+        let before = on_screen(&cam);
+        cam.pan(40.0, 0.0, 0.05);
+        assert!(
+            on_screen(&cam).x > before.x,
+            "a rightward drag must carry the room right"
+        );
+
+        let before = on_screen(&cam);
+        cam.pan(0.0, 40.0, 0.05);
+        assert!(
+            on_screen(&cam).y < before.y,
+            "and a downward drag (winit's y grows downwards) must carry it down"
+        );
+    }
+
+    #[test]
+    fn panning_never_orbits_or_dollies_on_the_way() {
+        let mut cam = OrbitCamera::default();
+        let (yaw, pitch, span) = (cam.yaw, cam.pitch, (cam.eye() - cam.target).length());
+        cam.pan(120.0, -80.0, 0.05);
+        assert_eq!(cam.yaw, yaw, "a pan is not a rotation");
+        assert_eq!(cam.pitch, pitch);
+        assert!(
+            (cam.eye() - cam.target).length() - span < 1e-5,
+            "nor a dolly: the eye rides along with the target"
+        );
+    }
+
+    #[test]
+    fn the_pan_step_is_the_pointer_delta_in_world_units() {
+        let mut cam = OrbitCamera::default();
+        let start = cam.target;
+        cam.pan(10.0, 0.0, 0.04);
+        let moved = cam.target - start;
+        assert!(
+            (moved.length() - 0.4).abs() < 1e-5,
+            "10 px at 0.04 units per pixel is 0.4 world units, got {:?}",
+            moved.length()
+        );
+
+        // Twice the pointer travel, twice the slide, same line.
+        let mut doubled = OrbitCamera::default();
+        doubled.pan(20.0, 0.0, 0.04);
+        assert!(
+            (doubled.target - start - moved * 2.0).length() < 1e-5,
+            "got {:?}",
+            doubled.target - start
+        );
+    }
+
+    #[test]
+    fn a_horizontal_drag_never_lifts_the_orbit_centre() {
+        // `right` lies in the floor plane at every pitch, so a sideways grab must
+        // not raise or drop the centre the camera swings around.
+        for pitch in [-0.22, 0.0, 0.42, 0.9, 1.4] {
+            let mut cam = OrbitCamera {
+                pitch,
+                yaw: 1.1,
+                ..Default::default()
+            };
+            let start = cam.target;
+            cam.pan(60.0, 0.0, 0.02);
+            assert!(
+                (cam.target.y - start.y).abs() < 1e-6,
+                "pitch {pitch}: the centre moved {:.6} in y",
+                cam.target.y - start.y
+            );
+        }
+    }
+
+    #[test]
+    fn pan_stays_finite_at_the_pitch_poles() {
+        let mut cam = OrbitCamera::default();
+        cam.orbit(0.0, 1.0e4);
+        cam.pan(60.0, 60.0, 0.1);
+        assert!(cam.target.is_finite(), "got {:?}", cam.target);
+        cam.orbit(0.0, -1.0e5);
+        cam.pan(60.0, 60.0, 0.1);
+        assert!(cam.target.is_finite(), "got {:?}", cam.target);
+    }
+
+    #[test]
+    fn recenter_restores_the_framing_but_not_the_users_other_settings() {
+        let mut cam = OrbitCamera::default();
+        cam.auto_orbit = false;
+        cam.auto_speed = 0.5;
+        cam.orbit(500.0, 300.0);
+        cam.dolly(3.0);
+        cam.pan(120.0, -80.0, 0.05);
+
+        cam.recenter();
+        let fresh = OrbitCamera::default();
+        assert_eq!((cam.yaw, cam.pitch, cam.distance), (fresh.yaw, fresh.pitch, fresh.distance));
+        assert_eq!(cam.target, fresh.target);
+        assert!(!cam.auto_orbit, "recentering must not re-arm auto-orbit");
+        assert_eq!(cam.auto_speed, 0.5, "nor reset its speed");
     }
 
     #[test]
