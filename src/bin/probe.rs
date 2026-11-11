@@ -209,7 +209,8 @@ fn main() {
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // No display handle: this probe never opens a window, and wgpu picks
-        // Metal on macOS from the defaults here.
+        // the platform's backend from the defaults here: Metal on macOS, Vulkan
+        // on Linux.
         display: None,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });

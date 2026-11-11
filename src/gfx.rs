@@ -17,8 +17,8 @@
 //! precisely the kind of thing that reads plausibly and is wrong. So
 //! `front_face` is a parameter rather than a literal, and `src/bin/probe.rs`
 //! settles it by checking that bodies — which live *inside* the room — are
-//! actually visible. On Metal with wgpu 30 the answer is `Ccw`, the same
-//! handedness GL used, not the flip the contract predicted.
+//! actually visible. With wgpu 30 the answer is `Ccw`, on Metal and on Vulkan
+//! alike — the same handedness GL used, not the flip the contract predicted.
 
 use crate::geom::{Mesh, ShapeDef};
 use crate::gpu_types::{self as gt, FrameUniforms, Light, ObjectUniforms, UNIFORM_SLOT_BYTES};
@@ -237,10 +237,14 @@ impl Gfx {
         }))
         .map_err(|e| format!("no suitable GPU adapter: {e:?}"))?;
 
-        let mut limits = wgpu::Limits::default();
-        // wgpu 30 widened the buffer-size limits to u64.
-        limits.max_uniform_buffer_binding_size =
-            (OBJECT_SLOTS_START * UNIFORM_SLOT_BYTES) as u64;
+        // Default limits are enough, and asking for more is what kept this off
+        // Linux. `max_uniform_buffer_binding_size` bounds one *binding*, not the
+        // buffer behind it, and the object ring is bound one `ObjectUniforms` at
+        // a time (see `make_object_bind_group`) however many slots it holds.
+        // Raising the limit to the whole ring's 128 KiB was never needed — Metal
+        // just happened to grant it, where Vulkan drivers commonly stop at the
+        // 64 KiB default (NVIDIA's `maxUniformBufferRange`) and refuse the device.
+        let limits = wgpu::Limits::default();
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("bouncing-room"),

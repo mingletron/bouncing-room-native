@@ -710,7 +710,9 @@ impl ApplicationHandler for App {
             WindowEvent::Touch(touch) if !consumed => self.on_touch(touch),
             // A file dragged over the window names itself here, which is the only
             // way to tell the user a drop will do something. winit gives real
-            // paths, so no dialog and no dependency is needed for this.
+            // paths, so no dialog and no dependency is needed for this. These
+            // three events arrive on macOS and X11; winit 0.30 does not deliver
+            // drops under Wayland, where the path box and `--import` remain.
             WindowEvent::HoveredFile(path) => {
                 self.settings.hovered_file = path
                     .file_name()
@@ -1076,9 +1078,11 @@ impl App {
             App::set_count(settings, world, settings.count);
         }
         if req.fullscreen {
-            // `Borderless(None)` is the display's own native mode, and on macOS
-            // winit gives the window a full-screen space of its own rather than
-            // covering the desktop — which is what a viewer like this wants. The
+            // `Borderless(None)` is the display's own native mode. On macOS winit
+            // gives the window a full-screen space of its own rather than
+            // covering the desktop; on Linux it is a request the compositor or
+            // window manager carries out — which is what a viewer like this
+            // wants either way. The
             // size change arrives as a `Resized` event, so `on_resize` reconfigures
             // the surface and `Gfx` rebuilds its attachments on the next frame.
             if window.fullscreen().is_some() {

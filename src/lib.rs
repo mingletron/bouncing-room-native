@@ -1,5 +1,5 @@
 //! Native port of the `bouncing-room` WebGL demo: a room full of bouncing
-//! primitives, drawn with wgpu (Metal on macOS) and controlled from an egui HUD.
+//! primitives, drawn with wgpu (Metal on macOS, Vulkan on Linux) and controlled from an egui HUD.
 //!
 //! The split mirrors the browser build:
 //!

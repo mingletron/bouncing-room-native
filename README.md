@@ -1,7 +1,7 @@
 # Bouncing room — native
 
 A room full of bouncing primitives, rendered natively in Rust with
-[wgpu](https://wgpu.rs) (Metal on this machine) and controlled from an
+[wgpu](https://wgpu.rs) (Metal on macOS, Vulkan on Linux) and controlled from an
 [egui](https://github.com/emilk/egui) HUD. It is the native port of a
 dependency-free WebGL app of the same name; the interface the port is written
 against — vertex formats, bind-group layouts, lighting maths, the simulation
@@ -29,6 +29,10 @@ cargo test                       # 51 unit + 6 fixture + 24 simulation invariant
 cargo run --bin probe -- --out probe.png    # headless render, then checks its own pixels
 cargo run -- --help              # CLI flags, including --import
 ```
+
+It runs on macOS and Linux from the same source, with no platform-specific code
+or build flags. On Linux it needs a Vulkan driver, and opens its window on Wayland
+or X11, whichever the session offers.
 
 The probe is the interesting one. It renders a **seeded** scene offscreen, writes a
 PNG, and then reads the picture back: every body's centre is projected into the
@@ -152,5 +156,9 @@ so the sampling above is visible in the output rather than only in the picture.
   per body, so an OBJ's `mtllib` is dropped and imports cycle a small palette.
 - **No up-axis or unit inference.** OBJ and STL carry neither, so the file's axes
   are kept as modelled: a Z-up CAD part lands on its side.
+- **No drag-and-drop under Wayland.** winit 0.30 delivers file drops on macOS and
+  X11 only, so in a Wayland session a dropped file is ignored; use the path box or
+  `--import`. Running with `WAYLAND_DISPLAY=` unset forces X11 (through XWayland),
+  where dropping works.
 - **The HUD is the only UI.** No menus, no file dialog: import by drop, path box,
   or flag.
