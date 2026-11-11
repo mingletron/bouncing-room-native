@@ -19,6 +19,7 @@
 //!   tested were the same code, a wrong constant would cancel out in both.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ use crate::camera::OrbitCamera;
 use crate::geom::{self, ShapeDef};
 use crate::gfx::{Disc, Gfx, GfxOptions, RenderTarget, Ring, RoomDraw, Scene};
 use crate::gpu_types::Light;
+use crate::import::{self, Import};
 use crate::sim::{self, SpawnOpts, World};
 
 use winit::application::ApplicationHandler;
@@ -73,6 +75,25 @@ const PANEL: Disc = Disc {
     color: [1.0, 0.94, 0.82],
 };
 
+/// Colours handed to imported geometry, cycled by import order. The primitives
+/// have a palette of their own in `geom`, and an import has no material to read
+/// (the OBJ's MTL is dropped), so it gets one of these instead of the last
+/// primitive's colour.
+const IMPORT_PALETTE: [[f32; 3]; 4] = [
+    [0.78, 0.8, 0.85],
+    [0.9, 0.62, 0.3],
+    [0.36, 0.78, 0.6],
+    [0.66, 0.42, 0.85],
+];
+/// Gloss of an imported body: mid-range, because a file's material properties
+/// are not read and a value at either extreme reads as a mistake.
+const IMPORT_GLOSS: f32 = 0.35;
+/// The collision radius factor for an import. Every built-in primitive has a
+/// tuned factor below 1 because its mesh does not fill its bounding sphere; an
+/// import is normalised *to* that sphere (rule 2 of [`import`]), so 1.0 is not an
+/// approximation of its collider, it is its collider.
+const IMPORT_RADIUS_FACTOR: f32 = 1.0;
+
 #[derive(Clone, Debug)]
 struct Settings {
     paused: bool,
@@ -94,9 +115,21 @@ struct Settings {
     /// Which primitive the next "Spawn one" adds.
     spawn_shape: usize,
     /// How big that one is — unless `spawn_random` leaves it to the sim, which
-    /// draws its own scale from 0.42 to 0.78.
+    /// draws its own scale from 0.42 to 0.78. An import always uses this number
+    /// and never the file's own units, which are not trustworthy across tools.
     spawn_size: f32,
     spawn_random: bool,
+    /// The path in the import box. Not touched until Import is pressed, so a
+    /// half-typed path never reaches the filesystem.
+    import_draft: String,
+    /// What the last import did, in words: how much geometry arrived, any repair
+    /// the reader had to make, or why it refused. It stays on screen until the
+    /// next attempt, because a truncation notice that vanishes in one frame is a
+    /// notice nobody reads.
+    import_note: String,
+    /// The file being dragged over the window right now, if any: the affordance
+    /// that says a drop will import rather than do nothing.
+    hovered_file: Option<String>,
 }
 
 /// Everything that only exists once there is a window and a device. It is one
@@ -117,6 +150,20 @@ struct Gpu {
     ring_mesh: usize,
 }
 
+/// One imported object, as the app keeps it.
+///
+/// `shape_index` is where its mesh sits in the three lists that must stay
+/// index-aligned because `Body::shape` indexes all of them: `App::shapes`,
+/// `Gpu.shape_mesh` and `World::colors`. The name is the file stem — which
+/// `Mesh::name` cannot carry, being a `&'static str` — and it is what the HUD
+/// lists and a removal would act on.
+#[derive(Clone, Debug)]
+struct ImportedShape {
+    source: String,
+    shape_index: usize,
+    triangles: usize,
+}
+
 pub struct App {
     settings: Settings,
     world: World,
@@ -129,6 +176,11 @@ pub struct App {
     /// place in the app where the world advances, and so a scrubbed step is
     /// [`FRAME_STEP`] of *simulated* time regardless of when the key was struck.
     step_requests: u32,
+    /// Imported objects, in the order they arrived, each named by its file stem.
+    imports: Vec<ImportedShape>,
+    /// Files waiting for a device: queued from the command line before there is a
+    /// window, and by a drag at any time.
+    pending: Vec<PathBuf>,
 
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -158,14 +210,57 @@ pub struct App {
     present_note: Option<String>,
 }
 
+/// The window binary's own usage. Short on purpose — the probe has the long help,
+/// and this only needs to say how to bring a file in without a window open first.
+const USAGE: &str = "\
+bouncing-room [options]
+
+  --import PATH   read an object into the room once the window exists; repeatable,
+                  and equivalent to dragging the file onto the window.
+                  Formats: .obj and .stl.
+  --help, -h      this text
+
+Keys: space pause · k kick · r reset · w wireframe · . step · h hud · f fullscreen
+· c recenters · x clear all. Drag to orbit, scroll to zoom, right-drag to grab.";
+
+/// The paths named by `--import`, in the order given. An unrecognised flag is
+/// reported and ignored rather than fatal: a stray argument from a launcher should
+/// not cost the user their window.
+fn cli_imports() -> Vec<PathBuf> {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut paths = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--import" => match args.next() {
+                Some(path) => paths.push(PathBuf::from(path)),
+                None => eprintln!("--import needs a path"),
+            },
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                // Not an error and nothing to unwind: the caller asked for help and
+                // has just been given it, before there is a window to tear down.
+                std::process::exit(0);
+            }
+            other => eprintln!("ignoring unrecognised argument {other}"),
+        }
+    }
+    paths
+}
+
 /// Start the app. Called from `main`.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let imports = cli_imports();
     let event_loop = EventLoop::new()?;
     // `Wait` plus a `request_redraw` every `about_to_wait` gives a continuously
     // animating frame that is still paced by the window system, instead of the
     // busy spin `ControlFlow::Poll` gives.
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new();
+    // Queued rather than imported here: there is no device yet, and registering a
+    // shape needs one. The first frame that has a `Gpu` reads them.
+    for path in imports {
+        app.queue_import(&path);
+    }
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -203,12 +298,17 @@ impl App {
                 spawn_shape: INITIAL_COUNT % geom::PRIMITIVE_NAMES.len(),
                 spawn_size: 0.55,
                 spawn_random: true,
+                import_draft: String::new(),
+                import_note: String::new(),
+                hovered_file: None,
             },
             world,
             shapes: geom::all_primitives(),
             camera: OrbitCamera::default(),
             accent_t: 0.0,
             step_requests: 0,
+            imports: Vec::new(),
+            pending: Vec::new(),
             window: None,
             gpu: None,
             egui_ctx,
@@ -306,17 +406,41 @@ impl App {
         });
     }
 
-    /// Grow or shrink the room to `count` bodies, settling afterwards so a pile
-    /// does not start inside itself. The browser build's count slider did the
-    /// same thing.
+    /// True for a body the room generated itself rather than one that came off
+    /// disk. The shape index is the whole test: generated bodies can only refer to
+    /// the nine built-in primitives, so anything at or past that range is an
+    /// import. `World` does not track the difference, and the difference matters
+    /// whenever a control means "the generated set" rather than "everything".
+    fn is_generated(body: &sim::Body) -> bool {
+        body.shape < geom::PRIMITIVE_NAMES.len()
+    }
+
+    /// How many bodies the count slider is responsible for, which is not how many
+    /// are in the room once anything has been imported.
+    fn generated_count(world: &World) -> usize {
+        world.bodies.iter().filter(|b| Self::is_generated(b)).count()
+    }
+
+    /// Grow or shrink the *generated* population to `count`, settling afterwards so
+    /// a pile does not start inside itself — the browser build's count slider did
+    /// the same thing. What is new is that imported bodies sit outside this count
+    /// and are not touched by it.
     fn set_count(settings: &mut Settings, world: &mut World, count: usize) {
         settings.count = count;
-        while world.bodies.len() < count {
-            let pick = world.bodies.len() % geom::PRIMITIVE_NAMES.len();
+        while Self::generated_count(world) < count {
+            let pick = Self::generated_count(world) % geom::PRIMITIVE_NAMES.len();
             world.record(pick, SpawnOpts::default());
         }
-        while world.bodies.len() > count {
-            world.bodies.pop();
+        while Self::generated_count(world) > count {
+            // Remove the newest generated body rather than the tail of the list.
+            // Popping the tail would delete an imported object, which is not what
+            // dragging a slider over the generated set means.
+            match world.bodies.iter().rposition(Self::is_generated) {
+                Some(i) => {
+                    world.bodies.remove(i);
+                }
+                None => break,
+            }
         }
         world.settle();
     }
@@ -328,14 +452,167 @@ impl App {
     /// The seed goes back on the generator first. Without that, `r` would keep
     /// walking down the same stream and give a different pile every press, and
     /// the number in the seed box would describe nothing.
+    /// Rebuild the generated bodies, leaving the world's tuned gravity, bounce and
+    /// friction as the HUD set them — which is why this is not "make a new World",
+    /// and why a naive reset quietly throws away the user's settings.
+    ///
+    /// The seed goes back on the generator first. Without that, `r` would keep
+    /// walking down the same stream and give a different pile every press, and the
+    /// number in the seed box would describe nothing.
+    ///
+    /// Imports survive a reset. Re-rolling the generated set should not discard
+    /// geometry that cost a trip to disk to make; [`App::clear_all`] is the control
+    /// that does, and it is a different button.
     fn reset(settings: &mut Settings, world: &mut World) {
         world.set_seed(settings.seed);
         world.impacts.clear();
-        world.bodies.clear();
+        world.bodies.retain(|b| !Self::is_generated(b));
         for i in 0..settings.count {
             world.record(i % geom::PRIMITIVE_NAMES.len(), SpawnOpts::default());
         }
         world.settle();
+    }
+
+    /// Empty the room of every body, generated and imported alike, and release the
+    /// imported shapes from the three per-shape lists that `Body::shape` indexes.
+    ///
+    /// The GPU buffers stay resident: `Gfx` has no eviction, and a handful of
+    /// imported meshes is not worth inventing an eviction policy for. After this
+    /// nothing refers to them, so they cost memory and no draw calls.
+    fn clear_all(
+        settings: &mut Settings,
+        world: &mut World,
+        shapes: &mut Vec<ShapeDef>,
+        shape_mesh: &mut Vec<usize>,
+        imports: &mut Vec<ImportedShape>,
+    ) {
+        world.bodies.clear();
+        world.impacts.clear();
+        let keep = geom::PRIMITIVE_NAMES.len();
+        // Truncating rather than clearing: the nine built-ins are addressed by
+        // index, and the generated bodies still point at them.
+        // Truncating rather than filtering is only sound because imports are
+        // appended, so every one of them sits past the nine built-ins. Asserted
+        // rather than assumed, because `add_import` is the only place that hands
+        // out indices and a future change there could break this silently.
+        debug_assert!(
+            imports.iter().all(|i| i.shape_index >= keep),
+            "an imported shape sits inside the built-in range: {imports:?}"
+        );
+        shapes.truncate(keep);
+        shape_mesh.truncate(keep);
+        world.colors.truncate(keep);
+        imports.clear();
+        settings.count = 0;
+        settings.import_note = "cleared every body".to_owned();
+    }
+
+    /// Read a file from disk and report the outcome in the panel, whether that
+    /// outcome is geometry or a reason it was refused.
+    fn import_one(
+        settings: &mut Settings,
+        world: &mut World,
+        shapes: &mut Vec<ShapeDef>,
+        gpu: &mut Gpu,
+        imports: &mut Vec<ImportedShape>,
+        path: &Path,
+    ) {
+        match import::import_path(path) {
+            Ok(import) => Self::add_import(settings, world, shapes, gpu, imports, import),
+            Err(e) => {
+                // Shown rather than logged: the panel is where the path was typed,
+                // so it is where the answer belongs. The marker is what lets the
+                // panel colour it as a failure without a second field to track.
+                settings.import_note = format!("✗ {e}");
+            }
+        }
+    }
+
+    /// Register an imported mesh as a shape and put one body holding it into the
+    /// room. Kept apart from [`App::import_one`] because the tests feed this a
+    /// mesh built in memory, with no file and no filesystem behind it.
+    fn add_import(
+        settings: &mut Settings,
+        world: &mut World,
+        shapes: &mut Vec<ShapeDef>,
+        gpu: &mut Gpu,
+        imports: &mut Vec<ImportedShape>,
+        import: Import,
+    ) {
+        // Read everything the note and the body need before `import.mesh` moves
+        // into the shape table.
+        let triangles = import.mesh.triangle_count();
+        let vertices = import.mesh.vertex_count();
+        let source = import.source.clone();
+        let notes = import.notes.clone();
+        let dropped = import.dropped_triangles;
+
+        let shape_index = shapes.len();
+        let color = IMPORT_PALETTE[imports.len() % IMPORT_PALETTE.len()];
+        let handle = gpu.gfx.upload_mesh(&import.mesh);
+        shapes.push(ShapeDef {
+            mesh: import.mesh,
+            color,
+            gloss: IMPORT_GLOSS,
+        });
+        gpu.shape_mesh.push(handle);
+        // The impact-ring palette is indexed by shape, so an imported body that
+        // wants a sensible ring colour has to have an entry here.
+        world.colors.push(color);
+
+        // The fragile part of this feature: three separately-owned lists that
+        // `Body::shape` indexes, which must not be allowed to drift.
+        debug_assert_eq!(shapes.len(), gpu.shape_mesh.len());
+        debug_assert_eq!(shapes.len(), world.colors.len());
+
+        let nth = imports.len();
+        imports.push(ImportedShape {
+            source: source.clone(),
+            shape_index,
+            triangles,
+        });
+
+        let scale = settings.spawn_size;
+        let radius = scale * IMPORT_RADIUS_FACTOR;
+        let (hx, hy, hz) = (sim::ROOM_HALF_X, sim::ROOM_HALF_Y, sim::ROOM_HALF_Z);
+        // Upright, at rest, above the pile. `World::spawn` is deliberately not
+        // used: it randomises orientation and velocity, and an imported object's
+        // modelled up-axis is information the file supplied that the room has no
+        // business discarding. The golden-angle offset stops repeated imports from
+        // landing on top of each other without needing a source of randomness.
+        let angle = nth as f32 * 2.399_963_3;
+        let reach = (0.8 + 0.4 * nth as f32).min((hx - radius).max(0.0));
+        let pos = glam::Vec3::new(
+            (reach * angle.cos()).clamp(-(hx - radius), hx - radius),
+            (hy - radius - 0.2).max(radius),
+            (reach * angle.sin()).clamp(-(hz - radius), hz - radius),
+        );
+        world.bodies.push(sim::Body {
+            shape: shape_index,
+            scale,
+            radius,
+            // The same rule `World::spawn` uses — mass follows volume — restated
+            // here rather than called, because an import's volume is its bounding
+            // sphere and its placement is not random.
+            mass: scale * scale * scale * 4.0 + 0.2,
+            pos,
+            vel: glam::Vec3::ZERO,
+            rot: glam::Mat4::IDENTITY,
+            ang_vel: glam::Vec3::ZERO,
+        });
+        world.settle();
+
+        // The counts and every repair the reader made, in the panel. A mesh that
+        // was cut down or had its normals rebuilt has to say so where the user can
+        // still see it, not only in a terminal they detached.
+        let mut note = format!("✓ {source}: {triangles} triangles, {vertices} vertices");
+        if dropped > 0 {
+            note.push_str(&format!(" — {dropped} dropped by the index limit"));
+        }
+        for note_extra in notes {
+            note.push_str(&format!("\n{note_extra}"));
+        }
+        settings.import_note = note;
     }
 }
 
@@ -431,6 +708,21 @@ impl ApplicationHandler for App {
                 self.dolly(delta);
             }
             WindowEvent::Touch(touch) if !consumed => self.on_touch(touch),
+            // A file dragged over the window names itself here, which is the only
+            // way to tell the user a drop will do something. winit gives real
+            // paths, so no dialog and no dependency is needed for this.
+            WindowEvent::HoveredFile(path) => {
+                self.settings.hovered_file = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned());
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.settings.hovered_file = None;
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.settings.hovered_file = None;
+                self.queue_import(&path);
+            }
             // A window that is minimized or completely behind other windows
             // cannot be presented to. winit says so here, which is what lets the
             // redraw loop park instead of burning a GPU every frame on a picture
@@ -511,6 +803,19 @@ impl App {
         if units != 0.0 {
             self.camera.dolly((-units * 0.12).exp());
         }
+    }
+
+    /// Accept a file for import, or say immediately why it cannot be. A format
+    /// nothing can read is refused here rather than queued, so the answer is on
+    /// screen while the pointer is still moving, and the path lands in the box as
+    /// well — editing it into a relative path is then a matter of typing.
+    fn queue_import(&mut self, path: &Path) {
+        if !import::is_supported(path) {
+            self.settings.import_note = import::unsupported_message(path);
+            return;
+        }
+        self.pending.push(path.to_path_buf());
+        self.settings.import_draft = path.display().to_string();
     }
 
     /// How many world units one vertical pixel spans at the current orbit
@@ -673,6 +978,8 @@ impl App {
             readout,
             adapter_label,
             present_note,
+            imports,
+            pending,
             ..
         } = self;
         let (Some(window), Some(gpu)) = (window.clone(), gpu.as_mut()) else {
@@ -739,15 +1046,25 @@ impl App {
         let count_before = settings.count;
         let mut req = HudRequests::default();
         let full_out = {
-            let (settings, world, camera, readout, req) = (
+            let (settings, world, camera, readout, req, imports) = (
                 &mut *settings,
                 &mut *world,
                 &mut *camera,
                 &*readout,
                 &mut req,
+                &*imports,
             );
             egui_ctx.run_ui(raw_input, move |ui| {
-                hud(ui, settings, world, camera, readout, req, &BODIES_RANGE);
+                hud(
+                    ui,
+                    settings,
+                    world,
+                    camera,
+                    readout,
+                    req,
+                    &BODIES_RANGE,
+                    imports,
+                );
             })
         };
         // Reset replaces the bodies but leaves the tuned gravity and bounce
@@ -769,6 +1086,19 @@ impl App {
             } else {
                 window.set_fullscreen(Some(Fullscreen::Borderless(None)));
             }
+        }
+        if req.clear {
+            App::clear_all(settings, world, shapes, &mut gpu.shape_mesh, imports);
+        }
+        // Imports are applied here rather than in the panel because registering
+        // one needs the device, the shape table, the colour list and the world at
+        // the same time, which is exactly what the borrow-splitting above forbids.
+        // Anything still queued when there was no device stays queued: a
+        // `--import` on the command line lands on the first frame that has one.
+        let mut queued = std::mem::take(pending);
+        queued.extend(req.imports.iter().cloned());
+        for path in queued {
+            App::import_one(settings, world, shapes, gpu, imports, &path);
         }
         // Frame-steps are asked for here and paid by the *next* frame's physics
         // block, which is what keeps a scrubbed step exactly FRAME_STEP long.
@@ -945,13 +1275,20 @@ const BODIES_RANGE: std::ops::RangeInclusive<usize> = 0..=48;
 /// that reaches past the world it is handed, such as re-seeding and rebuilding
 /// it at once. Collected in one struct so that a new request costs a field
 /// rather than another parameter on [`hud`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct HudRequests {
     reset: bool,
     steps: u32,
     /// Flip full screen. Asked for rather than done because the window belongs to
     /// `App`, not to the panel, and winit wants the call on the event-loop thread.
     fullscreen: bool,
+    /// Empty the room of every body, imports included. Requested for the same
+    /// reason as `reset`: it has to release imported shapes from the per-shape
+    /// lists as well as the world.
+    clear: bool,
+    /// Files to read. The panel cannot do this itself: an import needs the device
+    /// to upload a mesh, the shape table, the colour list and the world at once.
+    imports: Vec<PathBuf>,
 }
 
 /// Parse a seed the way the probe's `--seed` does — decimal, or hex behind `0x` —
@@ -1017,13 +1354,14 @@ fn hud(
     readout: &str,
     req: &mut HudRequests,
     bodies: &std::ops::RangeInclusive<usize>,
+    imports: &[ImportedShape],
 ) {
     // Shortcuts, read through egui so that a widget with keyboard focus keeps
     // its keys — the rule the browser build enforced by checking whether the
     // event target was an input element. The seed box is that widget now, so a
     // typed `.` or a typed `0x` stays in the box.
     if ui.memory(|m| m.focused().is_none()) {
-        let (space, k, r, w, period, h, f, c) = ui.input_mut(|i| {
+        let (space, k, r, w, period, h, f, c, x) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::K),
@@ -1033,6 +1371,7 @@ fn hud(
                 i.consume_key(egui::Modifiers::NONE, egui::Key::H),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::C),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::X),
             )
         });
         if space {
@@ -1063,6 +1402,11 @@ fn hud(
         // unlike a reset this touches nothing outside it.
         if c {
             camera.recenter();
+        }
+        // Clearing is requested rather than done: it has to release the imported
+        // shapes from the per-shape lists, which the panel is not holding.
+        if x {
+            req.clear = true;
         }
     }
 
@@ -1141,15 +1485,27 @@ fn hud(
                 ui.label("h hud · f fullscreen · c recenters");
                 ui.separator();
 
-                if ui.button("Spawn one").clicked() {
-                    let opts = if settings.spawn_random {
-                        SpawnOpts::default()
-                    } else {
-                        SpawnOpts::with_scale(settings.spawn_size)
-                    };
-                    world.record(settings.spawn_shape, opts);
-                    settings.count = world.bodies.len();
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Spawn one").clicked() {
+                        let opts = if settings.spawn_random {
+                            SpawnOpts::default()
+                        } else {
+                            SpawnOpts::with_scale(settings.spawn_size)
+                        };
+                        world.record(settings.spawn_shape, opts);
+                        // The slider governs the generated population, which once
+                        // anything has been imported is no longer the length of the
+                        // body list.
+                        settings.count = App::generated_count(world);
+                    }
+                    if ui
+                        .button("Clear all")
+                        .on_hover_text("x — every body out; unlike `r` this drops imported objects too")
+                        .clicked()
+                    {
+                        req.clear = true;
+                    }
+                });
                 // Nine one-word buttons rather than a dropdown: the primitives are
                 // the subject of the app, and seeing which one is armed is most of
                 // the point. `SpawnOpts::with_scale` has existed in the simulation
@@ -1247,6 +1603,50 @@ fn hud(
                 // The point of showing it at all: this is the number that makes a
                 // screenshot reproducible, and `probe --seed` takes it.
                 ui.label("what `r` replays · try it with probe --seed");
+
+                ui.separator();
+                if imports.is_empty() {
+                    ui.label("nothing imported");
+                } else {
+                    // Listed by name, so it is visible which bodies came off disk
+                    // and which file the note under them is about.
+                    for imported in imports {
+                        ui.label(format!(
+                            "{} · {} triangles",
+                            imported.source, imported.triangles
+                        ));
+                    }
+                }
+                ui.label(format!(
+                    "import {} — drag a file onto the window, or type its path",
+                    import::supported_hint()
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut settings.import_draft).desired_width(190.0),
+                    );
+                    if ui.button("Import").clicked() {
+                        let draft = settings.import_draft.trim().to_owned();
+                        if !draft.is_empty() {
+                            req.imports.push(PathBuf::from(draft));
+                        }
+                    }
+                });
+                if let Some(hovered) = settings.hovered_file.as_deref() {
+                    ui.label(format!("release to import {hovered}"));
+                }
+                if !settings.import_note.is_empty() {
+                    // A failure gets the error colour; a success is plain text
+                    // carrying the counts and every repair the reader made.
+                    if settings.import_note.starts_with('✗') {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            settings.import_note.as_str(),
+                        );
+                    } else {
+                        ui.label(settings.import_note.as_str());
+                    }
+                }
             });
         });
 }
@@ -1267,7 +1667,20 @@ mod tests {
             spawn_shape: 0,
             spawn_size: 0.55,
             spawn_random: true,
+            import_draft: String::new(),
+            import_note: String::new(),
+            hovered_file: None,
         }
+    }
+
+    /// A stand-in for a registered import. The panel lists these, and the layout
+    /// test wants that row rendered too rather than only its empty state.
+    fn sample_imports() -> Vec<ImportedShape> {
+        vec![ImportedShape {
+            source: "teapot".to_owned(),
+            shape_index: geom::PRIMITIVE_NAMES.len(),
+            triangles: 1_234,
+        }]
     }
 
     #[test]
@@ -1374,6 +1787,7 @@ mod tests {
         let mut world = World::default();
         let mut camera = OrbitCamera::default();
         let mut req = HudRequests::default();
+        let imports = sample_imports();
         for frame in 0..3 {
             let mut input = egui::RawInput::default();
             input.screen_rect = Some(egui::Rect::from_min_size(
@@ -1388,6 +1802,19 @@ mod tests {
             } else {
                 format!("{DEFAULT_SEED:#x}")
             };
+            // The same argument for the import row: a multi-line truncation note,
+            // a hover label that only exists mid-drag, and a path wider than the
+            // panel all have to survive the narrow window.
+            if frame == 1 {
+                settings.import_note = format!(
+                    "✓ big: 21844 triangles, {} vertices — 8156 dropped by the index \
+                     limit\nwireframe edges capped at 60000 segments",
+                    import::MAX_VERTS
+                );
+                settings.hovered_file = Some("teapot.fbx".to_owned());
+                settings.import_draft =
+                    "/Volumes/assets/a/path/longer/than/the/panel/teapot.obj".to_owned();
+            }
             let mut out = ctx.run_ui(input, |ui| {
                 hud(
                     ui,
@@ -1397,6 +1824,7 @@ mod tests {
                     "paused · 60 fps · 5 bodies",
                     &mut req,
                     &BODIES_RANGE,
+                    &imports,
                 );
             });
             assert!(
@@ -1426,6 +1854,7 @@ mod tests {
             world: &mut World,
             camera: &mut OrbitCamera,
             req: &mut HudRequests,
+            imports: &[ImportedShape],
             events: Vec<egui::Event>,
         ) -> egui::FullOutput {
             let mut input = egui::RawInput {
@@ -1445,6 +1874,7 @@ mod tests {
                     "60 fps · 5 bodies",
                     req,
                     &BODIES_RANGE,
+                    imports,
                 )
             });
             // Headless: no renderer to apply the font atlas to, and
@@ -1461,7 +1891,15 @@ mod tests {
         let mut req = HudRequests::default();
 
         settings.hud_hidden = true;
-        let hidden = frame(&ctx, &mut settings, &mut world, &mut camera, &mut req, vec![]);
+        let hidden = frame(
+            &ctx,
+            &mut settings,
+            &mut world,
+            &mut camera,
+            &mut req,
+            &[],
+            vec![],
+        );
         assert!(
             hidden.shapes.is_empty(),
             "a hidden HUD painted {} shapes, so the picture is not clean",
@@ -1481,11 +1919,20 @@ mod tests {
             &mut world,
             &mut camera,
             &mut req,
+            &[],
             vec![key(true), key(false)],
         );
         assert!(!settings.hud_hidden, "`h` must bring the panel back");
 
-        let shown = frame(&ctx, &mut settings, &mut world, &mut camera, &mut req, vec![]);
+        let shown = frame(
+            &ctx,
+            &mut settings,
+            &mut world,
+            &mut camera,
+            &mut req,
+            &[],
+            vec![],
+        );
         assert!(!shown.shapes.is_empty(), "the panel should paint again");
     }
 
@@ -1506,6 +1953,99 @@ mod tests {
 
         camera.recenter();
         assert_eq!(camera.target, OrbitCamera::default().target);
+    }
+
+    /// A body as `add_import` would put one in: a shape index past the built-ins,
+    /// a collider equal to its own bounding sphere, at rest.
+    fn imported_body(shape_index: usize, scale: f32) -> sim::Body {
+        sim::Body {
+            shape: shape_index,
+            radius: scale * IMPORT_RADIUS_FACTOR,
+            scale,
+            mass: scale * scale * scale * 4.0 + 0.2,
+            pos: glam::Vec3::new(0.0, 1.0, 0.0),
+            vel: glam::Vec3::ZERO,
+            rot: glam::Mat4::IDENTITY,
+            ang_vel: glam::Vec3::ZERO,
+        }
+    }
+
+    #[test]
+    fn the_count_slider_and_reset_manage_generated_bodies_not_imports() {
+        // The rule the panel implies: the slider and `r` are about the generated
+        // population. Without it, dragging the count down would delete an object
+        // that cost a trip off disk, in an app whose whole physics is a list.
+        let mut settings = test_settings();
+        let mut world = World::default();
+        App::reset(&mut settings, &mut world);
+        assert_eq!(world.bodies.len(), settings.count);
+
+        let imported_index = geom::PRIMITIVE_NAMES.len();
+        world.bodies.push(imported_body(imported_index, 0.6));
+        assert_eq!(
+            App::generated_count(&world),
+            settings.count,
+            "the import is not part of the count"
+        );
+
+        App::set_count(&mut settings, &mut world, 2);
+        assert_eq!(App::generated_count(&world), 2, "the slider shrank");
+        assert_eq!(world.bodies.len(), 3, "and the import survived");
+        assert!(
+            world.bodies.iter().any(|b| b.shape == imported_index),
+            "clearing to two must remove generated bodies, not the newest one"
+        );
+
+        App::reset(&mut settings, &mut world);
+        assert_eq!(
+            App::generated_count(&world),
+            settings.count,
+            "reset rebuilt the generated set from the seed"
+        );
+        assert!(
+            world.bodies.iter().any(|b| b.shape == imported_index),
+            "reset leaves imports where they are; Clear all is the control that does not"
+        );
+    }
+
+    #[test]
+    fn clear_all_empties_the_room_and_releases_imported_shapes() {
+        let mut settings = test_settings();
+        settings.count = 4;
+        let mut world = World::default();
+        App::reset(&mut settings, &mut world);
+        let imported_index = geom::PRIMITIVE_NAMES.len();
+        world.bodies.push(imported_body(imported_index, 0.5));
+        world.colors.push([0.5, 0.5, 0.5]);
+
+        let mut shapes = geom::all_primitives();
+        shapes.push(ShapeDef {
+            mesh: geom::quad_mesh(),
+            color: [0.5, 0.5, 0.5],
+            gloss: IMPORT_GLOSS,
+        });
+        let mut handles: Vec<usize> = (0..shapes.len()).collect();
+        let mut imports = sample_imports();
+
+        App::clear_all(&mut settings, &mut world, &mut shapes, &mut handles, &mut imports);
+
+        assert!(world.bodies.is_empty(), "every body is gone");
+        assert!(world.impacts.is_empty(), "and every ring with them");
+        let keep = geom::PRIMITIVE_NAMES.len();
+        assert_eq!(shapes.len(), keep, "imported shapes released");
+        assert_eq!(handles.len(), keep, "and their mesh handles with them");
+        assert_eq!(world.colors.len(), keep, "and the ring palette");
+        assert!(imports.is_empty(), "the panel list is empty");
+        assert_eq!(settings.count, 0, "the slider matches the empty room");
+
+        // The three lists are addressed by `Body::shape`, so they have to stay the
+        // same length as each other for the next spawn to be sound.
+        assert_eq!(shapes.len(), handles.len());
+        assert_eq!(shapes.len(), world.colors.len());
+
+        // And the room is usable again afterwards.
+        App::set_count(&mut settings, &mut world, 3);
+        assert_eq!(world.bodies.len(), 3);
     }
 
     #[test]

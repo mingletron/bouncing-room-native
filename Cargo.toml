@@ -34,3 +34,10 @@ winit = "0.30.13"
 # Used by the offscreen render probe (src/bin/probe.rs) so the native port can
 # be checked the way the browser probe checks the WebGL build.
 png = "0.18.1"
+# The Wavefront reader for `src/import.rs`. Chosen over hand-rolling because the
+# parts of OBJ that go wrong quietly are exactly the ones this avoids having to
+# get right: the four face-element index forms (`v`, `v/vt`, `v//vn`, `v/vt/vn`),
+# negative indices that count back from the last declared vertex, and fanning
+# polygons of arbitrary arity into the triangles the renderer draws. Everything
+# that is *not* parsing — welding, normalising, the u16 index budget — is here.
+tobj = "4.0.5"

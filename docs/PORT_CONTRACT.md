@@ -23,7 +23,7 @@ Differences forced by WebGPU:
 
 | File | Owner |
 | --- | --- |
-| `src/lib.rs`, `src/main.rs`, `src/app.rs`, `src/gfx.rs`, `src/gpu_types.rs`, `Cargo.toml` | integrator |
+| `src/lib.rs`, `src/main.rs`, `src/app.rs`, `src/camera.rs`, `src/gfx.rs`, `src/gpu_types.rs`, `src/import.rs`, `src/bin/probe.rs`, `Cargo.toml` | integrator |
 | `src/sim.rs`, `src/geom.rs`, `tests/sim_invariants.rs` | simulation port (built in `scratch-sim/` first) |
 | `shaders/lit.wgsl`, `shaders/line.wgsl`, `shaders/flat.wgsl` | shader port |
 
@@ -169,3 +169,57 @@ Every primitive has bounding radius exactly 1.0, and its collision radius is
 `scale * radius_factor(shape name)` where the factors live in `sim.rs`
 (sphere 1.0, cube 0.82, capsule 0.9, torus 0.86, cone 0.82, cylinder 0.85,
 icosahedron 0.95, tetrahedron 0.74, octahedron 0.86).
+
+## Imported geometry — `src/import.rs`
+
+The one exception to "everything is generated in code". A file enters through
+`import::import_path`, which returns a `Mesh` that already obeys four rules, and
+the app layer never has to re-check them:
+
+1. **One body per file.** Multi-object files (an OBJ with several `o`/`g` groups)
+   merge into a single mesh, because the sim collides bodies as spheres and
+   splitting an assembly would let its parts bounce apart from each other.
+2. **Normalised to a unit bounding radius**, so rule 2 of the section above applies
+   unchanged with `radius_factor = 1.0`: the collision sphere *is* the mesh's
+   bounds, not an approximation. File units are never trusted — only proportions.
+3. **Inside the u16 index budget** (`MAX_VERTS`). Over-budget meshes have whole
+   faces **sampled out at an even stride**, never cut from the tail: files are
+   written in spatially coherent order, so a tail-cut draws half an object while
+   its collider still spans the whole thing. Welding can only lower the vertex
+   count, so sizing the stride from the corner count cannot overshoot.
+4. **`edges` are synthesised** from the triangles, or the wireframe toggle would
+   draw nothing for an import.
+
+Every repair (sampling out, degenerate faces removed, normals rebuilt from the
+winding, edge cap) is reported in `Import::notes` and shown in the HUD. Silent
+geometry changes count as bugs.
+
+`.obj` reads through the `tobj` crate — added with the integrator's approval,
+because face-element index forms (`v`, `v/vt`, `v//vn`), negative indices and
+polygon fan-triangulation are the parts of OBJ that hand-rolling gets wrong.
+`.stl` is parsed here (binary and ASCII; the encoding is decided by header count
+*and* length rather than by a `solid` prefix, since plenty of binary STLs put the
+object name in that free-text field), and welded on position **and** normal so
+faceted models stay faceted instead of rounding their own edges off.
+
+`.fbx`, `.blend`, `.usd` and `.usdz` are refused with a message, not attempted: no
+maintained Rust reader exists for them (USD in particular is a composition system,
+so "read the mesh" means implementing a resolver). The seam for a converter is
+`import_path` — Blender and assimp both read all six and write OBJ — and
+everything downstream of it is already format-agnostic.
+
+`probe --import PATH` renders an imported mesh through the real GPU path and
+subjects it to the same pixel-visibility check as a generated primitive, so
+"imported" has a definition stronger than "parsed without error".
+
+Imported shapes are appended in lockstep to `App::shapes`, `Gpu.shape_mesh` and
+`World::colors`; all three are addressed by `Body::shape` and must stay the same
+length. `Body::shape >= PRIMITIVE_NAMES.len()` is the entire test for "this body
+is an import" — which is what lets the count slider and `r` manage only the
+generated population while `Clear all` (`x`) drops imports too.
+
+One buffer invariant the format implies: `Gfx::upload_mesh` pads index lists to
+`COPY_BUFFER_ALIGNMENT`. u16 entries cost 2 bytes each, so an **odd** index count
+(any odd triangle count) is 2 mod 4 and wgpu rejects the copy. Every generated
+primitive happens to have an even triangle count, which is how this stayed latent
+until a sampled file produced an odd one.

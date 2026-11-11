@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use bouncing_room_native::gfx::{Disc, Gfx, GfxOptions, RenderTarget, Ring, RoomDraw, Scene};
 use bouncing_room_native::gpu_types::Light;
 use bouncing_room_native::sim::{SpawnOpts, World};
-use bouncing_room_native::{OrbitCamera, geom, sim};
+use bouncing_room_native::{OrbitCamera, geom, import, sim};
 
 use glam::{Vec3, Vec4};
 
@@ -39,6 +39,8 @@ probe [options]
   --seconds S        simulated seconds before the shutter (default: 2.2)
   --front-face V     only render this room winding: cw | ccw | both (default: both)
   --keep-rings       draw impact rings (on by default; --no-rings to drop)
+  --import PATH      put an imported object (.obj or .stl) in the scene and
+                     require it to show up too; repeatable
   --hud              also render the egui overlay pass and check it composited
   --help             this text
 
@@ -101,6 +103,9 @@ struct Args {
     front_faces: Vec<wgpu::FrontFace>,
     rings: bool,
     hud: bool,
+    /// Files to import into the scene, each of which then has to pass the same
+    /// visibility check as a generated primitive.
+    imports: Vec<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -114,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
         front_faces: vec![wgpu::FrontFace::Cw, wgpu::FrontFace::Ccw],
         rings: true,
         hud: false,
+        imports: Vec::new(),
     };
 
     let mut argv = std::env::args().skip(1);
@@ -146,6 +152,7 @@ fn parse_args() -> Result<Args, String> {
                 "both" => args.front_faces = vec![wgpu::FrontFace::Cw, wgpu::FrontFace::Ccw],
                 other => return Err(format!("--front-face: cw | ccw | both, not {other}")),
             },
+            "--import" => args.imports.push(PathBuf::from(value("--import")?)),
             "--hud" => args.hud = true,
             "--no-rings" => args.rings = false,
             "--keep-rings" => args.rings = true,
@@ -210,7 +217,40 @@ fn main() {
         adapter.get_info().backend
     );
 
-    let shapes = geom::all_primitives();
+    // Imported geometry goes through the same reader the app uses, which is what
+    // makes a passing probe say "this mesh is drawn and visible" rather than
+    // merely "it parsed".
+    let imports: Vec<import::Import> = args
+        .imports
+        .iter()
+        .map(|path| {
+            import::import_path(path).unwrap_or_else(|e| panic!("probe: --import {e}"))
+        })
+        .collect();
+    for import in imports.iter() {
+        println!(
+            "probe: read {} — {} triangles, {} vertices{}",
+            import.source,
+            import.mesh.triangle_count(),
+            import.mesh.vertex_count(),
+            if import.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", import.notes.join("; "))
+            }
+        );
+    }
+    let mut shapes = geom::all_primitives();
+    // The probe keeps its own colour for an import rather than reading the app's,
+    // for the same reason it keeps its own lights: a shared constant that is wrong
+    // cancels out in a check that uses it.
+    for import in imports.iter() {
+        shapes.push(geom::ShapeDef {
+            mesh: import.mesh.clone(),
+            color: [0.78, 0.8, 0.85],
+            gloss: 0.35,
+        });
+    }
     let mut results = Vec::new();
     let mut hud_coverage = Vec::new();
 
@@ -244,6 +284,28 @@ fn main() {
         // against, so a body that any wall swallowed shows up as "this pixel
         // never changed".
         let mut world = seeded_world(args.seed, args.count);
+        // Imported bodies join the world under test but never the empty reference,
+        // so an imported mesh that fails to draw fails for the same reason and in
+        // the same terms as a body that a wall swallowed: "this pixel never
+        // changed". Their shape indices continue past the built-ins exactly as the
+        // app hands them out, which is what the per-shape lists are indexed by.
+        for i in 0..imports.len() {
+            let scale = 0.9 + 0.1 * i as f32;
+            world.bodies.push(sim::Body {
+                shape: geom::PRIMITIVE_NAMES.len() + i,
+                scale,
+                // Rule 2 of the importer: the mesh arrives normalised to a unit
+                // bounding radius, so this sphere is the collider, not an
+                // approximation of one.
+                radius: scale,
+                mass: scale * scale * scale * 4.0 + 0.2,
+                pos: glam::Vec3::new(0.0, 1.2 + 1.8 * i as f32, 0.0),
+                vel: glam::Vec3::ZERO,
+                rot: glam::Mat4::IDENTITY,
+                ang_vel: glam::Vec3::ZERO,
+            });
+        }
+        world.settle();
         run_physics(&mut world, args.seconds);
         let mut empty = seeded_world(args.seed, 0);
         run_physics(&mut empty, args.seconds);

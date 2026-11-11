@@ -194,6 +194,25 @@ pub struct RenderTarget<'a> {
     pub height: u32,
 }
 
+/// A u16 index list as the bytes `Queue::write_buffer` will accept.
+///
+/// wgpu requires both a buffer's size and the length of a write into it to be a
+/// multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes). An index list costs 2 bytes an
+/// entry, so an *odd* number of entries lands on 2 mod 4 and the copy is rejected
+/// outright. Every mesh this renderer had before files existed happened to have an
+/// even triangle count, which is why it took an imported object to find this:
+/// [`crate::import`] samples faces out of oversized meshes and is content to leave
+/// an odd number of them behind.
+///
+/// The padding is never drawn. `GpuMesh` stores the real index count alongside the
+/// buffer, and that count is what `draw_indexed` is given.
+fn padded_index_bytes(indices: &[u16]) -> Vec<u8> {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    let mut bytes = bytemuck::cast_slice(indices).to_vec();
+    bytes.resize(bytes.len().div_ceil(align) * align, 0);
+    bytes
+}
+
 impl Gfx {
     /// Create a device and all four pipelines against an existing `instance`.
     ///
@@ -548,26 +567,28 @@ impl Gfx {
         self.queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
 
         let index_buffer = mesh.indices.as_ref().map(|idx| {
+            let bytes = padded_index_bytes(idx);
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("indices"),
-                // A zero-size buffer is not allowed, hence the floor of one index.
-                size: (idx.len() * std::mem::size_of::<u16>()).max(2) as u64,
+                // A zero-size buffer is not allowed, hence the floor of one padded
+                // record. The length is already a multiple of the copy alignment.
+                size: bytes.len().max(wgpu::COPY_BUFFER_ALIGNMENT as usize) as u64,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(idx));
+            self.queue.write_buffer(&buf, 0, &bytes);
             (buf, idx.len() as u32)
         });
 
         let line_buffer = (!mesh.edges.is_empty()).then(|| {
+            let bytes = padded_index_bytes(&mesh.edges);
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("edges"),
-                size: (mesh.edges.len() * std::mem::size_of::<u16>()) as u64,
+                size: bytes.len() as u64,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue
-                .write_buffer(&buf, 0, bytemuck::cast_slice(&mesh.edges));
+            self.queue.write_buffer(&buf, 0, &bytes);
             (buf, mesh.edges.len() as u32)
         });
 
@@ -941,4 +962,32 @@ fn make_object_bind_group(
             }),
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_odd_index_list_is_padded_to_the_copy_alignment() {
+        // What this guards is a validation error at upload time rather than a
+        // wrong picture, so the assertion is about byte lengths, not pixels: an odd
+        // entry count is 2 mod 4 bytes and wgpu refuses the copy.
+        assert_eq!(padded_index_bytes(&[0]).len(), 4, "one index needs 4 bytes");
+        let three = padded_index_bytes(&[0, 1, 2]);
+        assert_eq!(three.len(), 8, "three indices are 6 bytes, rounded up");
+        assert_eq!(&three[6..], &[0, 0], "and the pad is zeroes, not garbage");
+        assert_eq!(padded_index_bytes(&[]).len(), 0, "an empty list stays empty");
+
+        // The shape `import` actually produces for an oversized file: an odd
+        // 57 801-entry index buffer, which is what the probe used to crash on.
+        for count in [1usize, 3, 5, 57_801, 60_000] {
+            let idx: Vec<u16> = (0..count as u32).map(|i| i as u16).collect();
+            assert_eq!(
+                padded_index_bytes(&idx).len() % wgpu::COPY_BUFFER_ALIGNMENT as usize,
+                0,
+                "{count} indices are not aligned"
+            );
+        }
+    }
 }
