@@ -41,6 +41,8 @@ probe [options]
   --keep-rings       draw impact rings (on by default; --no-rings to drop)
   --import PATH      put an imported object (.obj or .stl) in the scene and
                      require it to show up too; repeatable
+  --wireframe    draw the edge overlay as well as the solids (the visibility
+                     check reads solid pixels either way)
   --hud              also render the egui overlay pass and check it composited
   --help             this text
 
@@ -103,6 +105,9 @@ struct Args {
     front_faces: Vec<wgpu::FrontFace>,
     rings: bool,
     hud: bool,
+    /// The edge overlay on every mesh, which is how a screenshot can show an
+    /// import that had whole faces sampled out of it.
+    wireframe: bool,
     /// Files to import into the scene, each of which then has to pass the same
     /// visibility check as a generated primitive.
     imports: Vec<PathBuf>,
@@ -119,6 +124,7 @@ fn parse_args() -> Result<Args, String> {
         front_faces: vec![wgpu::FrontFace::Cw, wgpu::FrontFace::Ccw],
         rings: true,
         hud: false,
+        wireframe: false,
         imports: Vec::new(),
     };
 
@@ -153,6 +159,7 @@ fn parse_args() -> Result<Args, String> {
                 other => return Err(format!("--front-face: cw | ccw | both, not {other}")),
             },
             "--import" => args.imports.push(PathBuf::from(value("--import")?)),
+            "--wireframe" => args.wireframe = true,
             "--hud" => args.hud = true,
             "--no-rings" => args.rings = false,
             "--keep-rings" => args.rings = true,
@@ -216,6 +223,18 @@ fn main() {
         adapter.get_info().name,
         adapter.get_info().backend
     );
+    if args.wireframe {
+        // Worth saying out loud, because it changes what a pass means: the check
+        // asks whether a body's pixels differ from the reference render, and an
+        // edge overlay adds pixels of its own. The room's own outline is drawn on
+        // both sides so it cancels, but a mesh's edges are not, so with this flag a
+        // body can register from its wireframe alone rather than from a surface.
+        // The winding verdict is only as strong as a solid run.
+        println!(
+            "probe: wireframe on — a body may count as visible from its edges, not \
+             only its surfaces; run without this flag for the strict verdict"
+        );
+    }
 
     // Imported geometry goes through the same reader the app uses, which is what
     // makes a passing probe say "this mesh is drawn and visible" rather than
@@ -326,6 +345,7 @@ fn main() {
             &camera,
             &lights,
             args.rings,
+            args.wireframe,
             args.width,
             args.height,
             None,
@@ -341,6 +361,11 @@ fn main() {
             &camera,
             &lights,
             false,
+            // The wireframe goes into the reference render as well as the one under
+            // test, so the room's own outline cancels out of the comparison and the
+            // only edge lines that can register are the bodies' — see the note at
+            // the top of `main` about what a wireframe run does to the verdict.
+            args.wireframe,
             args.width,
             args.height,
             None,
@@ -368,6 +393,7 @@ fn main() {
                 &camera,
                 &lights,
                 args.rings,
+                args.wireframe,
                 args.width,
                 args.height,
                 Some(&mut renderer),
@@ -600,6 +626,10 @@ fn render(
     camera: &OrbitCamera,
     lights: &[Light; 3],
     rings: bool,
+    // The edge overlay rather than only the solids. Off by default: the visibility
+    // check reads solid pixels either way, but a wireframe is how an import that
+    // had whole faces sampled out of it shows that for what it is.
+    wireframe: bool,
     width: u32,
     height: u32,
     hud: Option<&mut egui_wgpu::Renderer>,
@@ -649,7 +679,7 @@ fn render(
         rings: &splash,
         quad_mesh,
         ring_mesh,
-        wireframe: false,
+        wireframe,
     };
 
     let target = RenderTarget {
