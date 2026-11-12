@@ -980,6 +980,20 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Everything that talks to the window system goes *now*, while the
+        // event loop — and with it the connection to the display — still
+        // exists. `run_app` consumes the loop, so by the time it returns and
+        // `App` is dropped in the ordinary way the connection is already gone.
+        // Under Wayland that was a segfault on every exit: egui's clipboard
+        // runs a thread of its own on that connection, and it was still using
+        // it. The order matters too: egui's state first, then the surface,
+        // then the window the surface was made from.
+        self.egui_state = None;
+        self.gpu = None;
+        self.window = None;
+    }
+
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // `resumed` rebuilds them; holding a surface across a suspend is how
         // these apps get killed on platforms that do suspend.
