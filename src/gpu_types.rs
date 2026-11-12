@@ -1,10 +1,28 @@
 //! CPU-side mirrors of the WGSL uniform structs, plus the transform helpers the
 //! renderer needs.
 //!
-//! The byte layouts here are load-bearing: they are asserted against the sizes
-//! naga computes for `shaders/*.wgsl` (see `tests/gpu_layout.rs`, which compiles
-//! the shaders and compares). If a field is added, reordered or padded here, it
-//! has to be added there in the same position or the render reads garbage.
+//! The byte layouts here are load-bearing, and naga 30 rejects `@offset`/`@size`, so
+//! layout in the WGSL copies follows declaration order alone. That makes one mistake
+//! the real hazard: a field added, deleted, reordered or retyped in one copy but not
+//! the others. Two mechanisms cover it.
+//!
+//! 1. The asserts at the bottom of this file pin **sizes and every field offset**,
+//!    using `offset_of!`. They catch drift inside this file — including the swap of two
+//!    same-typed fields, which no size check can see.
+//! 2. `tests/gpu_layout.rs` parses each shader's copy out of its text, computes the
+//!    offsets with WGSL's alignment rules, and compares both the member list and those
+//!    offsets against `offset_of!` values from these structs. So the shaders are checked
+//!    against Rust's actual layout, not against a hand-written transcription of it.
+//!
+//! What neither can do: check that a *name* means the same thing on both sides
+//! (`shadow` here and `shadow` in a shader are only the same idea if someone kept them
+//! that way), or see a shader struct that shrank below these sizes — that still
+//! validates, because the bind group declares only `min_binding_size`, and the render
+//! reads the wrong fields silently. And the attribute tables in `gfx.rs` restate
+//! `Instance`/`LineVertex` offsets by hand, with nothing comparing the two: change an
+//! offset in this file and its assert fires, but the copy in `gfx.rs` moves only because
+//! whoever fixed the assert remembered. If a field is added, reordered or padded here,
+//! it has to be added in the same position in every shader copy that mirrors the struct.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3, Vec4};
@@ -93,6 +111,34 @@ const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 288);
 const _: () = assert!(std::mem::size_of::<Instance>() == 96);
 const _: () = assert!(std::mem::size_of::<LineVertex>() == 28);
 const _: () = assert!(std::mem::size_of::<Light>() == 32);
+
+// Offsets too, because sizes alone cannot pin them. Swap `floor_color` and
+// `ceil_color`, or `cam_pos` and `shadow` — pairs of the same type — and every size
+// above still holds, this file still compiles, `tests/gpu_layout.rs` still passes, and
+// the shaders spend the frame reading the camera position out of the shadow block.
+// WGSL lays out by declaration order alone, the four shader copies were never touched,
+// and nothing above notices: the only thing that changed is which slot holds what.
+//
+// `offset_of!` is the one way to ask a type where its own fields sit, so every field
+// position the rest of the renderer depends on is pinned here — including the two
+// vertex records, whose byte offsets `gfx.rs` repeats by hand in its attribute tables.
+// `tests/gpu_layout.rs` compares each member parsed out of a shader against these same
+// numbers, which is what makes the shaders checked against Rust's layout rather than
+// against a third transcription of it.
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, view) == 0);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, proj) == 64);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, lights) == 128);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, cam_pos) == 224);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, floor_color) == 240);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, ceil_color) == 256);
+const _: () = assert!(std::mem::offset_of!(FrameUniforms, shadow) == 272);
+const _: () = assert!(std::mem::offset_of!(Light, pos) == 0);
+const _: () = assert!(std::mem::offset_of!(Light, color) == 16);
+const _: () = assert!(std::mem::offset_of!(Instance, model) == 0);
+const _: () = assert!(std::mem::offset_of!(Instance, color) == 64);
+const _: () = assert!(std::mem::offset_of!(Instance, params) == 80);
+const _: () = assert!(std::mem::offset_of!(LineVertex, pos) == 0);
+const _: () = assert!(std::mem::offset_of!(LineVertex, color) == 12);
 
 /// Model matrix for a body: translate, then apply the body's orthonormal
 /// rotation, then a uniform scale. Mirrors `modelMatrix()` in the WebGL build,
