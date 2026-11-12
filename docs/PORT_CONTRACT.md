@@ -47,7 +47,7 @@ Y-up, world units; the room spans x/z in `[-halfX, halfX]` and y in `[0, halfY]`
 
 | Owner | Files |
 | --- | --- |
-| integrator | `src/lib.rs`, `src/main.rs`, `src/app.rs`, `src/camera.rs`, `src/gfx.rs`, `src/gpu_types.rs`, `src/import.rs`, `src/record.rs`, `src/effects.rs`, `src/bin/probe.rs`, `README.md`, `docs/`, `Cargo.toml`, `.github/` |
+| integrator | `src/lib.rs`, `src/main.rs`, `src/app.rs`, `src/camera.rs`, `src/gfx.rs`, `src/gpu_types.rs`, `src/import.rs`, `src/record.rs`, `src/effects.rs`, `src/audio.rs`, `src/bin/probe.rs`, `README.md`, `docs/`, `Cargo.toml`, `.github/` |
 | simulation port | `src/sim.rs`, `src/hull.rs`, `src/geom.rs`, `tests/sim_invariants.rs`, `tests/new_physics.rs`, `scratch-sim/` |
 | shader port | `shaders/lit.wgsl`, `shaders/line.wgsl`, `shaders/flat.wgsl`, `shaders/shadow.wgsl`, `shaders/trail.wgsl` |
 | either, with a note | `tests/import_fixtures.rs`, `tests/gpu_layout.rs`, `tests/fixtures/` |
@@ -57,8 +57,10 @@ first version of this document; that has since been crossed deliberately, with
 approval. The additions are `tobj` (Wavefront), `gltf` (glTF/GLB, default features
 off — this renderer has no texture coordinates to put an image on), `rfd` (the
 system file dialog, needed because winit delivers no file drops under Wayland) and
-`gif` (clip recording). A converter branch in `src/import.rs` needs **no** new
-dependency: it is `std::process::Command` plus the glTF reader that is already here.
+`gif` (clip recording), and `cpal` (the audio output stream — see the sound section; it
+is the dependency that makes the Linux job install `libasound2-dev`). A converter branch
+in `src/import.rs` needs **no** new dependency: it is `std::process::Command` plus the
+glTF reader that is already here.
 
 ## Shared CPU/GPU structs — `src/gpu_types.rs`
 
@@ -333,7 +335,15 @@ pub struct Body { pub shape: usize, pub scale: f32, pub radius: f32, pub mass: f
                   pub pos: Vec3, pub vel: Vec3, pub rot: Mat4, pub ang_vel: Vec3 }
 
 pub struct Impact { pub pos: Vec3, pub n: Vec3, pub color: [f32; 3],
-                    pub base_radius: f32, pub age: f32, pub life: f32 }
+                    pub base_radius: f32, pub speed: f32, pub shape: usize,
+                    pub age: f32, pub life: f32 }
+
+// `speed` is the closing speed along the contact normal, before the bounce, and
+// `shape` the shape the contact is credited to. A ring needs neither: a ring exists
+// only because the speed already cleared a threshold. Sound is made of nothing else,
+// and by the time a frame is drawn the bodies have changed velocity, so neither can
+// be recovered downstream. `sim.rs` is the simulation port's file; the change here is
+// two fields at four construction sites and touches no part of the solver.
 
 pub struct World {
     // room and contents
@@ -607,6 +617,93 @@ entry count is `2 mod 4` and wgpu rejects the copy outright. Every generated
 primitive happens to have an even triangle count, which is how this stayed latent
 until an import sampled down to an odd one.
 
+## Sound — `src/audio.rs`
+
+The mixer sits downstream of the step and behind a mutex, reading the same records the
+sparks read. Nothing in it can reach the physics, which is why a run sounds different
+with the volume up and simulates identically — the same guarantee `effects` makes about
+the picture.
+
+**Event source.** `world.impacts`, with the same freshness rule `Effects` uses: an
+impact is pushed at `age: 0.0` and aged by exactly this step's `dt`, so "new this step"
+is `hit.age <= dt * 1.001`. The frame loop filters, maps each through `hit_for` and hands
+the result to the stream.
+
+**The mapping**, in `hit_for` — pure, no device, no allocation:
+
+| from the contact | to the voice |
+| --- | --- |
+| `speed` | gain: `((speed − WALL_IMPACT_SPEED) / (LOUDEST_SPEED − WALL_IMPACT_SPEED)).clamp(0,1) ^ 0.75`, floor taken from the sim's own report threshold rather than from zero, so a settled pile is quiet instead of constantly middling; anything under `MIN_GAIN` is not voiced at all |
+| `base_radius` | pitch: `98 Hz × (0.9 / r) ^ 1.4`, capped at 1400 Hz, then snapped to a pentatonic ladder rooted at A1 (55 Hz) |
+| `shape` | timbre: `SHAPE_BRIGHT[shape]` for the nine built-ins (sphere 0.25 … tetrahedron 0.8), `IMPORT_BRIGHT` for anything from a file |
+| `pos.x / ROOM_HALF_X` | pan, equal-power |
+| timbre and pitch | ring time: low and dull ring longest, capped at **0.3 s** — see "short by design" below |
+
+**Why synthesis rather than samples.** No assets, nothing to license, and every audible
+parameter is a function of the contact — a recorded one-shot would discard the speed and
+the radius and look something up instead. Each voice is the fundamental plus two
+*inharmonic* partials (2.76 and 5.4 — non-integer ratios are what read as struck metal
+rather than as an organ note) plus a few tens of milliseconds of noise, which is what
+makes a hit an event rather than a note fading in. A one-millisecond attack stops the
+onset being a step discontinuity, i.e. a click.
+
+**Short by design.** No voice outlives 0.3 s, and the low end is only about 2.5× the high
+end rather than 6×, because a voice that outlives its neighbours is what turns a roomful
+of impacts into a wash: the second hit you cannot hear is usually the one the eye is on. An
+earlier tuning let the biggest bodies ring for two thirds of a second, and fourteen of
+those overlapping is not a bounce, it is a drone. `every_hit_is_over_before_a_third_of_a_second`
+pins the ceiling *in the samples* as well as in the struct, and asserts how far the
+envelope has actually decayed by three quarters of a voice's length — which is where a
+wash would start, and roughly where a retuning would push it back up.
+
+**A lifetime that means what it says.** An exponential never reaches zero, so `render`
+gates each voice on `age >= life` rather than on an amplitude floor. Without that gate a
+voice keeps sounding past its nominal end and is retired only *between* callback blocks:
+harmless at the ~10 ms blocks devices ask for, and a whole block of leaked ringing at any
+other size. The gate is what makes `MAX_LIFE` a statement about the audio rather than
+about a struct field.
+
+**The ladder is a decision, not fidelity.** 150 slightly different natural pitches from a
+settling pile are a bee-swarm; the same pile on a pentatonic ladder is an instrument
+being played, and any two hits that land together are consonant. Monotonicity survives the
+snapping, so harder is still louder and smaller is still higher, and a test walks speed and
+radius across their range to insist neither ever doubles back.
+
+**Two caps, doing two different jobs.** `MAX_PER_FRAME` (4) bounds how many hits one frame
+may *start*; `MAX_VOICES` (14) bounds how many are in flight across frames. When a burst
+exceeds the frame allowance the loudest survive, tie-broken by incoming index — which
+makes the kept set a function of the contacts, and the test asserts that the same
+contacts in the same order produce the same voices twice over. (Reversing the input
+legitimately changes which *equal-gain* contacts win, and the test says so rather than
+pretending otherwise.)
+
+**Headroom, not a limiter.** Every voice is divided by the total gain in flight
+(`volume / total.max(1.0)`) and the mix is clamped to ±1, so many small contacts cannot
+walk past full scale while one hard hit still dominates ten soft ones.
+
+**Sample rate.** A voice stores *frequencies*, never phase increments; the increment is
+computed per block against the device's rate. Baking increments in at 44.1 kHz makes every
+hit a semitone and a half sharp on a 48 kHz desktop — the bug this design avoids and
+`the_same_hit_is_the_same_pitch_at_any_device_rate` pins by measuring zero-crossing rates
+at both. The 1400 Hz cap exists for the same reason: the third partial of anything above
+it approaches Nyquist at 44.1 kHz and would fold back down as a spurious tone rather than
+merely disappearing.
+
+**Devices and teardown.** cpal 0.15's path is `default_host → default_output_device →
+default_output_config → build_output_stream(config, callback, err_fn, None)`, and
+`StreamTrait` offers `play` and `pause` and **no shutdown**. The app therefore holds
+`Option<Result<Audio, String>>`: `None` until the first frame that has a window and wants
+sound — so a headless run, a test and `--mute` never touch the audio system — and
+`Err(reason)` on a machine with no usable device, remembered once and shown in the panel
+instead of being re-asked sixty times a second. `App::exiting` pauses the stream *first*,
+before the egui state, the surface and the window, so the callback has demonstrably
+stopped reaching the mixer; dropping the handle straight after releases the device.
+
+**Threading.** The mixer lives behind `Arc<Mutex<…>>`: the frame thread appends under the
+lock for the length of a push, the audio thread renders one block under it. A purist would
+want a lock-free ring buffer; the honest description of the trade is that the callback cost
+here is tens of microseconds and the room's population is capped at 4000.
+
 ## The probe — `src/bin/probe.rs`
 
 Renders a seeded scene offscreen and reads its own pixels back, so "imported" and
@@ -668,6 +765,13 @@ Things a future change could break silently, because nothing checks them:
 - Picking with the mouse, the rewind slider, the file dialog and drag-and-drop are
   covered by tests of their parts, not driven end to end; the release workflow builds
   for Linux and macOS but has never been run.
+- **Sound is unverified where it matters.** No CI machine has an audio device, so the 17
+  sound tests drive `Mixer::render` against hand-made buffers and never a stream; what no
+  test can decide is whether the design *sounds* right. And the Linux build's ALSA
+  dependency (`libasound2-dev`, `pkg-config`) is satisfied only by the workflow step,
+  which has never run — a plain `cargo build` on a bare Linux box is untested here.
+- **Recorded clips are silent.** A GIF has no audio track, so a captured demo carries
+  none of the sound the app was making. Nothing in the recording path can add one.
 - **Quitting mid-conversion orphans the tool.** The child runs to its 120 s ceiling with
   no window left, and its temp directory survives, because a `Drop` guard cannot run at
   process exit and the name is never reused. Closing it means a cancel flag `run_capped`

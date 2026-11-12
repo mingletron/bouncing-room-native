@@ -139,6 +139,16 @@ pub struct Impact {
     pub n: Vec3,
     pub color: [f32; 3],
     pub base_radius: f32,
+    /// Approach speed along the contact normal, in units/s, *before* the bounce.
+    /// A ring does not need it — a ring only exists at all because this speed
+    /// cleared a threshold — but "how hard" is exactly what a sound is built from,
+    /// and by the time the frame is drawn the bodies have already changed velocity.
+    /// So it is recorded here, at the contact, and nothing downstream recomputes it.
+    pub speed: f32,
+    /// The shape this contact is credited to, which sets a sound's timbre. The wall
+    /// contacts use the body that hit; the pair contacts use body `a`, the same body
+    /// whose palette colour the ring is drawn in, so the ring and the click agree.
+    pub shape: usize,
     pub age: f32,
     pub life: f32,
 }
@@ -958,6 +968,8 @@ fn resolve_wall(
             n,
             color: impact_color(colors, b.shape),
             base_radius: b.radius * 0.55,
+            speed: approach,
+            shape: b.shape,
             age: 0.0,
             life: 0.5,
         });
@@ -1054,6 +1066,8 @@ fn collide_pair(
             n: -n,
             color: impact_color(colors, a.shape),
             base_radius: a.radius.min(b.radius) * 0.5,
+            speed: approach,
+            shape: a.shape,
             age: 0.0,
             life: 0.42,
         });
@@ -1142,6 +1156,8 @@ fn collide_hull_with_walls(
                 n,
                 color: impact_color(colors, b.shape),
                 base_radius: reach * 0.45,
+                speed: approach,
+                shape: b.shape,
                 age: 0.0,
                 life: 0.5,
             });
@@ -1214,6 +1230,8 @@ fn collide_rigid_pair(
             n: -n,
             color: impact_color(colors, a.shape),
             base_radius: a.radius.min(b.radius) * 0.5,
+            speed: approach,
+            shape: a.shape,
             age: 0.0,
             life: 0.42,
         });

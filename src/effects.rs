@@ -190,6 +190,8 @@ mod tests {
             n: Vec3::Y,
             color: [1.0, 0.2, 0.2],
             base_radius: 0.3,
+            speed: 3.0,
+            shape: 0,
             age: dt,
             life: 0.5,
         });

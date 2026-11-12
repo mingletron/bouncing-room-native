@@ -54,3 +54,4 @@ rfd = "0.18"
 # Recorded clips (`src/record.rs`). GIF because it plays everywhere a README
 # does and needs no codec.
 gif = "0.14"
+cpal = "0.15"

@@ -8,12 +8,13 @@
 //! * [`gfx`] is the render pass, [`gpu_types`] the CPU/GPU shared layouts,
 //!   [`camera`] the orbit camera, [`import`] geometry read in from disk.
 //! * [`hull`] is the convex-hull collider imports use, [`effects`] the trails
-//!   and sparks, and [`record`] the GIF recorder — none of which the browser
-//!   build had.
+//!   and sparks, [`audio`] the collision sound, and [`record`] the GIF recorder —
+//!   none of which the browser build had.
 //! * [`app`] glues them to a window: winit events, the surface, the egui HUD,
 //!   and the frame loop.
 
 pub mod app;
+pub mod audio;
 pub mod camera;
 pub mod effects;
 pub mod geom;

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::audio::{self, Audio};
 use crate::camera::OrbitCamera;
 use crate::effects::Effects;
 use crate::geom::{self, ShapeDef};
@@ -157,6 +158,16 @@ struct Settings {
     shadows: bool,
     trails: bool,
     sparks: bool,
+    /// Collision sound on or off. Off mutes the mixer rather than closing the stream:
+    /// the difference is audible only in how fast sound returns when it is switched back
+    /// on, and leaving the stream open is what makes the switch free of a hiccup.
+    sound: bool,
+    /// Master volume, 0..1, applied in the mixer on the audio thread — the headroom
+    /// division happens after it, so turning it up cannot clip.
+    volume: f32,
+    /// Why this machine has no output stream, in the words the panel shows: set once,
+    /// when the one attempt to open a device fails, rather than asked again each frame.
+    audio_note: Option<String>,
     /// The faceted primitives collide as their actual shape instead of as
     /// spheres. Off by default: the sphere model is the one the browser build
     /// had, and what the seeds were tuned against.
@@ -303,6 +314,12 @@ pub struct App {
     /// its receiver, because a failure has to say which file failed and the panel has to
     /// say what is running now.
     converting: Vec<(String, mpsc::Receiver<Result<Import, String>>)>,
+    /// The output stream, once there is one to have. `None` until the first frame that
+    /// has a window and wants sound — so a headless run, a test and `--mute` never touch
+    /// the audio system at all — and `Err(reason)` on a machine with no usable device,
+    /// which the panel states in words instead of panicking: containers, remote sessions
+    /// and boxes with no output hardware all land here, and the room does not care.
+    audio: Option<Result<Audio, String>>,
     effects: Effects,
     history: History,
     grab: Option<Grab>,
@@ -353,23 +370,29 @@ bouncing-room [options]
 
   --import PATH   read an object into the room once the window exists; repeatable,
                   and equivalent to dragging the file onto the window.
-                  Formats: .obj, .stl, .gltf and .glb.
+                  Read here: .obj, .stl, .gltf, .glb. Converted by Blender (or
+                  assimp, for .fbx) first, which costs seconds: .fbx, .blend,
+                  .usd, .usda, .usdc, .usdz.
+  --mute          start with collision sound off; `s` turns it back on, and the
+                  panel has a volume slider.
   --record S      record S seconds (at most 20) as an animated GIF, print where
                   it was saved, and quit.
   --help, -h      this text
 
 Keys: space pause · k kick · r reset · w wireframe · . step · h hud · f fullscreen
-· c recenters · x clear all · , step back · o open a file · v record a clip.
+· c recenters · x clear all · , step back · o open a file · v record a clip ·
+s collision sound.
 Drag to orbit, scroll to zoom, right-drag to pan. Click a body to hold it and
 let go to throw it.";
 
 /// The paths named by `--import`, in the order given. An unrecognised flag is
 /// reported and ignored rather than fatal: a stray argument from a launcher should
 /// not cost the user their window.
-fn cli_args() -> (Vec<PathBuf>, Option<f32>) {
+fn cli_args() -> (Vec<PathBuf>, Option<f32>, bool) {
     let mut args = std::env::args().skip(1).peekable();
     let mut paths = Vec::new();
     let mut record = None;
+    let mut muted = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--import" => match args.next() {
@@ -380,6 +403,10 @@ fn cli_args() -> (Vec<PathBuf>, Option<f32>) {
                 Some(seconds) if seconds > 0.0 => record = Some(seconds.min(record::MAX_SECONDS)),
                 _ => eprintln!("--record needs a number of seconds"),
             },
+            // Sound is the one control worth starting off from a command line: a
+            // recording run, a demo capture, or anyone who wants the room silent on
+            // launch. `s` turns it back on without a restart.
+            "--mute" => muted = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 // Not an error and nothing to unwind: the caller asked for help and
@@ -389,12 +416,12 @@ fn cli_args() -> (Vec<PathBuf>, Option<f32>) {
             other => eprintln!("ignoring unrecognised argument {other}"),
         }
     }
-    (paths, record)
+    (paths, record, muted)
 }
 
 /// Start the app. Called from `main`.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let (imports, record) = cli_args();
+    let (imports, record, muted) = cli_args();
     let event_loop = EventLoop::new()?;
     // `Wait` plus a `request_redraw` every `about_to_wait` gives a continuously
     // animating frame that is still paced by the window system, instead of the
@@ -402,6 +429,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new();
     app.auto_record = record;
+    // Set before the first frame, so a muted launch never opens an output stream at
+    // all rather than opening one and then silencing it.
+    app.settings.sound = !muted;
     // Queued rather than imported here: there is no device yet, and registering a
     // shape needs one. The first frame that has a `Gpu` reads them.
     for path in imports {
@@ -451,6 +481,9 @@ impl App {
                 shadows: true,
                 trails: false,
                 sparks: true,
+                sound: true,
+                volume: 0.7,
+                audio_note: None,
                 primitive_hulls: false,
                 record_note: String::new(),
             },
@@ -462,6 +495,7 @@ impl App {
             imports: Vec::new(),
             pending: Vec::new(),
             converting: Vec::new(),
+            audio: None,
             effects: Effects::default(),
             history: History::default(),
             grab: None,
@@ -1043,8 +1077,18 @@ impl ApplicationHandler for App {
         // `App` is dropped in the ordinary way the connection is already gone.
         // Under Wayland that was a segfault on every exit: egui's clipboard
         // runs a thread of its own on that connection, and it was still using
-        // it. The order matters too: egui's state first, then the surface,
-        // then the window the surface was made from.
+        // it. The order matters too: the audio thread first, then egui's state, then
+        // the surface, then the window the surface was made from.
+        //
+        // Sound goes first because its callback runs on a thread of its own and reads
+        // the mixer, and cpal 0.15 offers no shutdown — only pause. Pausing is what
+        // shows the callback has stopped before anything it could reach is gone;
+        // dropping the handle straight after is what releases the device.
+        if let Some(Ok(stream)) = self.audio.take() {
+            if let Err(why) = stream.pause() {
+                eprintln!("audio: {why}");
+            }
+        }
         self.egui_state = None;
         self.gpu = None;
         self.window = None;
@@ -1295,6 +1339,7 @@ impl App {
             imports,
             pending,
             converting,
+            audio: audio_state,
             effects,
             history,
             grab,
@@ -1328,6 +1373,41 @@ impl App {
             history.record(world, *accent_t);
         }
 
+        // Open the output device on the first frame that has a window and wants sound,
+        // never in `new`: a machine with no device gets one `Err` remembered here and
+        // shown once in the panel rather than a stream that cannot exist and a panic that
+        // would take the window with it. Retrying every frame would mean asking the audio
+        // system the same failing question sixty times a second.
+        if settings.sound && audio_state.is_none() {
+            let opened = Audio::open(settings.volume);
+            if let Err(why) = opened.as_ref() {
+                // Also to stderr: the panel line is small, and a headless or remote
+                // session is exactly where nobody is looking at the panel.
+                eprintln!("audio: {why} — running silent");
+                // Stated once, where the panel can see it: `hud` is a separate function
+                // with its own borrow list and no view of this field, so the reason
+                // travels in Settings rather than growing another parameter.
+                settings.audio_note = Some(why.clone());
+            }
+            *audio_state = Some(opened);
+        }
+        // A remembered failure is cleared while sound is off, which makes the control
+        // that switches sound off and back on double as the manual retry: a user who has
+        // just plugged in an output device (or started a PulseAudio/ PipeWire session
+        // under the app) can get sound without quitting, while a permanently broken audio
+        // system is still only asked once per sound-on period rather than sixty times a
+        // second.
+        if !settings.sound && matches!(audio_state, Some(Err(_))) {
+            *audio_state = None;
+            settings.audio_note = None;
+        }
+        if let Some(Ok(stream)) = audio_state.as_mut() {
+            // Cheaper than tracking whether either control moved, and it cannot be
+            // missed: two locks a frame, each held for a store.
+            stream.set_muted(!settings.sound);
+            stream.set_volume(settings.volume);
+        }
+
         // A held body is pulled toward the pointer before the step, so the
         // step carries it there. A body that no longer exists is let go.
         if let Some(held) = *grab {
@@ -1348,6 +1428,22 @@ impl App {
             world.step(dt);
             *accent_t += light_dt;
             effects.after_step(world, dt, settings.trails, settings.sparks);
+            // Sound reads the same fresh-contact filter sparks do: an impact is pushed
+            // with age 0 and has been aged by exactly this step's `dt`, so "new this
+            // step" is testable without a device. And nothing here can reach the physics:
+            // the mixer is downstream of the step, on the far side of a mutex.
+            if settings.sound {
+                if let Some(Ok(stream)) = audio_state.as_mut() {
+                    let hits: Vec<(audio::Hit, u64)> = world
+                        .impacts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, hit)| hit.age <= dt * 1.001)
+                        .map(|(i, hit)| (audio::hit_for(hit, sim::ROOM_HALF_X), i as u64))
+                        .collect();
+                    stream.note(hits);
+                }
+            }
             history.record(world, *accent_t);
         };
         if settings.paused {
@@ -1497,6 +1593,12 @@ impl App {
         if bodies_replaced {
             *grab = None;
             effects.clear();
+            if let Some(Ok(stream)) = audio_state.as_mut() {
+                // A hit from before a reset should not keep ringing after it, for the
+                // same reason a trail may not streak from where a body was to where it
+                // suddenly is.
+                stream.clear();
+            }
         }
 
         // The file dialog runs on a thread of its own and answers here. It is
@@ -1965,7 +2067,7 @@ fn hud(
     // event target was an input element. The seed box is that widget now, so a
     // typed `.` or a typed `0x` stays in the box.
     if ui.memory(|m| m.focused().is_none()) {
-        let (space, k, r, w, period, h, f, c, x, comma, o, v) = ui.input_mut(|i| {
+        let (space, k, r, w, period, h, f, c, x, comma, o, v, s) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::K),
@@ -1979,6 +2081,7 @@ fn hud(
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Comma),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::O),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::V),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::S),
             )
         });
         // `,` is the other half of `.`: one frame back instead of one forward.
@@ -1990,6 +2093,9 @@ fn hud(
         }
         if v {
             req.record = true;
+        }
+        if s {
+            settings.sound = !settings.sound;
         }
         if space {
             settings.paused = !settings.paused;
@@ -2240,6 +2346,21 @@ fn hud(
                     .on_hover_text("cast from the ceiling light; off uses the ground blobs");
                 ui.checkbox(&mut settings.sparks, "sparks");
                 ui.checkbox(&mut settings.trails, "trails");
+                ui.checkbox(&mut settings.sound, "sound").on_hover_text(
+                    "hits are synthesised from the contact: harder is louder, smaller is \
+                     higher, and the pitch ladder keeps a crowd consonant",
+                );
+                if let Some(why) = settings.audio_note.as_ref() {
+                    // A machine with no output device keeps simulating exactly as it
+                    // would with one; the panel says why the silence is not a mute.
+                    ui.label(format!("no audio: {why}"));
+                } else if settings.sound {
+                    ui.add(
+                        egui::Slider::new(&mut settings.volume, 0.0..=1.0)
+                            .text("volume")
+                            .show_value(false),
+                    );
+                }
                 ui.checkbox(&mut camera.auto_orbit, "auto-orbit");
 
                 ui.separator();
@@ -2367,6 +2488,9 @@ mod tests {
             shadows: true,
             trails: false,
             sparks: true,
+            sound: false,
+            volume: 0.7,
+            audio_note: None,
             primitive_hulls: false,
             record_note: String::new(),
         }

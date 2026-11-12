@@ -43,6 +43,16 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
+      # cpal reaches ALSA on Linux through alsa-sys, which links against libasound at
+      # build time via pkg-config. Without these two packages the Linux *build* fails to
+      # compile, which is the honest failure mode of a C dependency rather than a sound
+      # feature that quietly does nothing. (The binary that comes out still needs
+      # libasound2 at run time, as any Linux audio program does; that is normal on a
+      # desktop, and the machine has no sound device to reach in any case.)
+      - name: Install ALSA build deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

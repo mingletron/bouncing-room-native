@@ -34,20 +34,27 @@ It goes past what the WebGL build did in a few directions:
 - **Hull colliders.** Imported objects collide as their convex hull rather than
   as a ball, and the faceted primitives can too.
 - **glTF**, with its material colours.
+- **Collision sound.** Every hit is synthesised from the contact itself — harder is
+  louder, smaller is higher — with a pentatonic pitch ladder so that two hundred bodies
+  landing at once read as an instrument being played rather than as a swarm.
 - **Record a clip** as an animated GIF, from the app or from the probe.
 
 ## Run it
 
 ```sh
 cargo run --release              # the window
-cargo test                       # 106 tests: units, fixtures, simulation invariants
+cargo test                       # 137 tests: units, fixtures, simulation invariants
+cargo test -- --ignored          # + the one check that needs a real audio device
 cargo run --bin probe -- --out probe.png    # headless render, then checks its own pixels
-cargo run -- --help              # CLI flags, including --import and --record
+cargo run -- --help              # CLI flags, including --import, --record and --mute
 ```
 
-It runs on macOS and Linux from the same source, with no platform-specific code
-or build flags. On Linux it needs a Vulkan driver, and opens its window on Wayland
-or X11, whichever the session offers.
+It runs on macOS and Linux from the same source, with no platform-specific code in
+`src/`. On Linux it needs a Vulkan driver, and opens its window on Wayland or X11,
+whichever the session offers — and, since the sound is ALSA, two build-time packages
+first: `sudo apt-get install -y libasound2-dev pkg-config`. The release workflow
+installs them; a plain `cargo build` on a bare Linux box will not get past `alsa-sys`
+until you do.
 
 `--release` matters once the room is crowded: a debug build is fine for a few
 dozen bodies and slow for a few thousand.
@@ -86,10 +93,11 @@ spec could decide, because WebGPU's framebuffer convention inverts GL's.
 | `f` | full screen (the display's native mode) |
 | `o` | open files in the system's own dialog |
 | `v` | start or stop recording a clip |
+| `s` | collision sound on or off; the panel also has a volume slider |
 
 The panel carries sliders for gravity, bounce, simulation speed, body count (0
 empties the room, 4000 fills it), air drag, wall grip, body grip and spin
-coupling; a rewind slider; toggles for body-body collisions, hull colliders,
+coupling; a rewind slider; toggles for body-body collisions, hull colliders, sound,
 wireframe, shadows, sparks, trails and auto-orbit; buttons for pause, step, kick,
 reset, clear, spawn, record and re-seed; a picker for which of the nine
 primitives the next spawn adds and how big it is; and a seed box.
@@ -119,6 +127,33 @@ where the file went, and quits.
 
 The four contact dials are worth a moment: `spin coupling` is what turns a sliding
 body into a rolling one, and at 0 the room is effectively frictionless ice.
+
+## Sound
+
+Nothing is sampled. A hit is a few partials and a short noise burst, and every number
+in it comes from the contact that made it: the closing speed sets how loud it is, the
+contact radius sets the pitch (a boulder thuds at A1, a pebble pings two and a half
+octaves up), the shape sets the timbre — a sphere is dull, a tetrahedron is a metallic
+ping — and where along the room the contact happened sets the pan. There are no audio
+files in this repository, and nothing to license.
+
+Two things about it are design decisions rather than physics, and both are worth knowing
+before you decide the sound is wrong:
+
+- **Hits are short.** Nothing rings longer than a third of a second, and the biggest,
+  dullest body in the room is only about two and a half times longer than the smallest —
+  a voice that outlives its neighbours is what turns a roomful of impacts into a wash.
+- **Pitches are snapped to a pentatonic ladder.** A settling pile reports a hundred and
+  fifty contacts with a hundred and fifty slightly different natural pitches, which
+  sounds like a bee-swarm; on a ladder the same pile sounds like something being played.
+  The mapping stays monotonic, so harder is still louder and smaller is still higher.
+- **A crowd is capped.** Four new hits per frame and fourteen in flight at once, and
+  when the ceiling bites, the *loudest* are the ones kept. So in a 3000-body room you
+  hear the significant impacts, not all of them, and the panel can say how many were
+  turned away.
+
+Clips are silent: a GIF has no audio track. On a machine with no output device the room
+runs identically and the panel says why the silence is not a mute.
 
 ## Importing objects
 
@@ -260,6 +295,7 @@ included".
 | `shaders/*.wgsl` | lit, flat, line, trail and shadow shaders |
 | `src/import.rs` | reading `.obj`, `.stl` and glTF into the shape list, and converting the six formats it cannot read |
 | `src/effects.rs` | trails and sparks |
+| `src/audio.rs` | collision sound: the mixer, the synthesis, and the caps that keep a crowd listable |
 | `src/record.rs` | the GIF recorder |
 | `src/app.rs`, `src/camera.rs` | the window, the HUD, the frame loop, the orbit camera |
 | `src/bin/probe.rs` | the offscreen render and the pixel checks described above |
@@ -294,6 +330,14 @@ included".
 - **No up-axis or unit inference.** OBJ and STL carry neither, so the file's axes are
   kept as modelled: a Z-up CAD part lands on its side. For a converted file the
   converter decides instead — and the import's notes say that is what happened.
+- **Four new sounds per frame, fourteen at once.** Beyond that the loudest wins, which
+  is a decision about a 3000-body room rather than a limitation of the mixer: hearing
+  every contact in a pile is not information, it is a rumble.
+- **Sound is the one part no test can finish.** The mapping, the caps, the pan, the
+  envelope and the sample-rate handling are all tested against a fake buffer with no
+  device involved (18 of them), but whether it *sounds* right is not testable, no CI
+  machine has an audio device, and the Linux build's ALSA dependency is only exercised by
+  the release workflow, not locally here.
 - **Trails cover the first 500 bodies.** Thousands of them are a blur, and they
   are rebuilt and uploaded every frame.
 - **The six converted formats are checked on development machines, not in CI.**
