@@ -125,11 +125,12 @@ body into a rolling one, and at 0 the room is effectively frictionless ice.
 ![Three imported objects among the primitives: a pale spike, a pale faceted diamond, and a crumpled sheet that arrived sampled because it was too big for the index format](docs/screenshots/imported.png)
 
 Press **Open…** (or `o`) for the system file dialog, drag a file onto the window,
-type its path into the panel, or pass `--import PATH` at startup. Supported:
-**`.obj`** (Wavefront, read through [`tobj`](https://crates.io/crates/tobj)),
-**`.stl`** (binary and ASCII, parsed in-tree), and **`.gltf` / `.glb`** (glTF
-2.0, through [`gltf`](https://crates.io/crates/gltf)). Whatever arrives obeys
-four rules:
+type its path into the panel, or pass `--import PATH` at startup. Read in this
+process: **`.obj`** (Wavefront, through [`tobj`](https://crates.io/crates/tobj)),
+**`.stl`** (binary and ASCII, parsed in-tree), and **`.gltf` / `.glb`** (glTF 2.0,
+through [`gltf`](https://crates.io/crates/gltf)). Converted first, by an external
+tool: **`.fbx`, `.blend`, `.usd`, `.usda`, `.usdc`, `.usdz`** — see below. Whatever
+arrives, by whichever route, obeys four rules:
 
 1. **One body per file.** A multi-object OBJ or a whole `.blend`-style assembly
    merges into a single mesh, because bodies collide as bounding spheres and
@@ -165,14 +166,42 @@ available for the cube, cone, cylinder and the three faceted solids, behind the
 "for the faceted primitives too" checkbox; it is off by default because the
 all-spheres model is the one the WebGL build had.
 
-`.fbx`, `.blend`, `.usd` and `.usdz` are refused with a message rather than
-attempted: FBX is a binary AST with mutually incompatible dialects, `.blend` is a
-self-describing blob whose layout tracks Blender's own version, and USD is a
-*composition* system where the geometry you see may be instanced, inherited
-across layers, or refined from a proxy. No maintained Rust reader exists for any
-of them. The seam for adding a converter is `import::import_path` — Blender and
-assimp both read all of them and write OBJ or glTF — and everything downstream of it is
-already format-agnostic.
+**The other six formats are converted, not parsed.** FBX is a binary AST with
+mutually incompatible dialects, `.blend` is a self-describing blob whose layout
+tracks Blender's own version, and USD is a *composition* system where the geometry
+you see may be instanced, inherited across layers or refined from a proxy — so
+"read the mesh" means implementing a resolver, and no maintained Rust reader exists
+for any of them. Instead the app runs the file through Blender headless, which
+writes a self-contained `.glb`, and hands that to the same glTF reader. `.fbx` falls
+back to `assimp` when Blender cannot take it. Everything downstream — welding,
+normalising, the index budget, edges, hulls — is the four rules above, and never
+notices which route the bytes took. A `.usdz`, which is a zip archive this process
+could not open by itself, arrives as geometry the same way.
+
+That table is measured rather than assumed, and the measurements are the reason the
+two recipes differ instead of one command line for everything. On Blender 5.0 the
+importers are `bpy.ops.wm.fbx_import` and `bpy.ops.wm.usd_import`, and they have to
+be called explicitly: `blender -b model.fbx` says "File format is not supported",
+because FBX is an addon import and only the `.blend` loader gets handed a filename.
+And `assimp export model.blend` fails with "BLENDER magic bytes are missing,
+couldn't find GZIP header either" — its Blender loader predates the format Blender
+2.8+ writes, which is why `.blend` has no fallback and `.fbx` does. The tests ask
+Blender which operators it has instead of trusting the names in this file, because
+`hasattr` and `.idname()` on `bpy.ops` will happily invent an operator for any
+string you hand them.
+
+A conversion costs seconds, so it runs on a worker thread and lands in a later
+frame; the panel says *converting …* while it goes, rather than looking frozen.
+**One file converts at a time**: drop ten `.fbx` files and you get ten waits in a row,
+not ten Blenders at once — the start-up is the cost either way, and each of them holds a
+scene's worth of memory while it runs. The panel says how many are queued behind the one
+it is working on.
+Nothing is installed behind your back: a machine with neither tool gets an error
+that says so and names the `BLENDER` and `ASSIMP` variables that would point at
+them. And a round trip through a converter is a re-export — whatever the source
+carried that glTF cannot say is gone, and units, up-axis and materials are what the
+converter decided. That goes in the import's notes rather than being left for you to
+notice in the picture.
 
 The image above is the same scene with `tests/fixtures/spike.obj`,
 `diamond.stl`, `crumple.stl` and `two-tone.glb` added; the crumpled sheet is
@@ -206,6 +235,20 @@ The probe appends the winding to the name it is given (`room-ccw.png`), hence th
 renaming. It prints the counts and every repair for each import as it reads them,
 so the sampling above is visible in the output rather than only in the picture.
 
+A converted format is worth checking the same way, because the file never enters this
+process at all — Blender does, and the probe imports synchronously on purpose so that
+this works headlessly:
+
+```sh
+blender -b --python-expr "import bpy; bpy.ops.mesh.primitive_cube_add(size=2); \
+    bpy.ops.export_scene.fbx(filepath='/tmp/cube.fbx')"
+cargo run --bin probe -- --front-face ccw --import /tmp/cube.fbx --out /tmp/converted
+```
+
+It prints which tool converted the file and what that tool decided, and its exit
+status still means "exactly one room winding showed every body, this import
+included".
+
 ## Where things live
 
 | File | What it is |
@@ -215,7 +258,7 @@ so the sampling above is visible in the output rather than only in the picture.
 | `src/hull.rs` | convex hulls: building one from a mesh, and its contact tests |
 | `src/gfx.rs`, `src/gpu_types.rs` | instanced pipelines, the shadow cube, MSAA, offscreen capture, and the CPU/GPU structs they read |
 | `shaders/*.wgsl` | lit, flat, line, trail and shadow shaders |
-| `src/import.rs` | reading `.obj`, `.stl` and glTF into the shape list |
+| `src/import.rs` | reading `.obj`, `.stl` and glTF into the shape list, and converting the six formats it cannot read |
 | `src/effects.rs` | trails and sparks |
 | `src/record.rs` | the GIF recorder |
 | `src/app.rs`, `src/camera.rs` | the window, the HUD, the frame loop, the orbit camera |
@@ -235,15 +278,29 @@ so the sampling above is visible in the output rather than only in the picture.
   moment of inertia of a solid sphere its size, not the body's own. It reads
   right; it is not a rigid-body engine.
 - **Only glTF brings colour, and no format brings textures.** An OBJ's `mtllib`
-  is dropped, and OBJ and STL imports cycle a small palette.
+  is dropped, and OBJ and STL imports cycle a small palette. A converted file keeps
+  whatever colour the converter chose to write into the glTF, which is not necessarily
+  what the source said.
+- **Quitting during a conversion leaves the tool running.** It is not stopped: it runs to
+  its 120 s ceiling after the window is gone, and its temporary directory is left behind.
+  `x` (clear every body) does cancel what is queued and discards answers that come back,
+  so the room stays empty — the leftover is process and disk, not geometry.
+- **Six formats need a tool this app does not ship.** `.fbx`, `.blend`, `.usd`,
+  `.usda`, `.usdc` and `.usdz` are converted by Blender (or assimp, for FBX only), so
+  they work where one of those is installed and say so where neither is. `BLENDER` and
+  `ASSIMP` point at non-standard installs. A cube costs about a second to convert
+  here; nothing heavier was measured, and a conversion that outlives 120 s is stopped
+  and reported rather than left running.
+- **No up-axis or unit inference.** OBJ and STL carry neither, so the file's axes are
+  kept as modelled: a Z-up CAD part lands on its side. For a converted file the
+  converter decides instead — and the import's notes say that is what happened.
 - **Trails cover the first 500 bodies.** Thousands of them are a blur, and they
   are rebuilt and uploaded every frame.
-- **The contract describes the port, not the additions.**
-  [`docs/PORT_CONTRACT.md`](docs/PORT_CONTRACT.md) still specifies a per-object
-  uniform block; the renderer now passes those values per instance instead, and
-  shadows, hulls and the rest are outside it altogether.
-- **No up-axis or unit inference.** OBJ and STL carry neither, so the file's axes
-  are kept as modelled: a Z-up CAD part lands on its side.
+- **The six converted formats are checked on development machines, not in CI.**
+  The release runners have neither Blender nor assimp, so the conversion tests skip
+  there — out loud, in the test output — and `cargo test` says nothing about those
+  formats. The check that proves the whole path, render included, is
+  `cargo run --bin probe -- --import asset.fbx`.
 - **No drag-and-drop under Wayland.** winit 0.30 delivers file drops on macOS and
   X11 only, so in a Wayland session a dropped file is ignored; use Open…, the
   path box or `--import`. Running with `WAYLAND_DISPLAY=` unset forces X11 (through XWayland),

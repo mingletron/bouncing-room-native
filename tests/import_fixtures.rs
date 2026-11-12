@@ -180,15 +180,17 @@ fn every_fixture_obeys_the_same_rules_as_every_import() {
 }
 
 #[test]
-fn an_unsupported_format_is_named_before_the_file_is_still_looked_for() {
+fn an_unimportable_format_is_named_before_the_file_is_still_looked_for() {
     // A path inside the real fixtures directory that does not exist: the answer
     // must still be about the format, because the app asks this question the
-    // moment a file is dropped, before it has any idea what is on disk.
-    let path = fixture("model.fbx");
+    // moment a file is dropped, before it has any idea what is on disk. It used to
+    // use `.fbx` as the example; `.fbx` is importable now, by conversion, so the
+    // extension with no path at all has to be one neither list mentions.
+    let path = fixture("model.rar");
     assert!(!path.exists(), "this test is about the extension, not the bytes");
     assert!(!import::is_supported(&path));
     match import::import_path(&path) {
-        Err(ImportError::Unsupported { extension }) => assert_eq!(extension, "fbx"),
+        Err(ImportError::Unsupported { extension }) => assert_eq!(extension, "rar"),
         other => panic!(
             "expected Unsupported for {}, got {other:?}",
             path.display()
@@ -202,10 +204,49 @@ fn an_unsupported_format_is_named_before_the_file_is_still_looked_for() {
 }
 
 #[test]
+fn a_converted_format_is_offered_whatever_this_machine_has_installed() {
+    // The other half of the same question. `is_supported` is what the drop handler,
+    // the typed path and the file dialog all ask, and it deliberately knows nothing
+    // about whether Blender or assimp is here: an answer that changed with the
+    // toolchain would make the UI offer a format one second and refuse it the next.
+    // A missing converter belongs in the failure message instead, which
+    // `src/import.rs` tests end to end — it has to spawn the tools to find out.
+    assert!(import::needs_converter(&fixture("model.fbx")));
+    assert!(!import::needs_converter(&fixture("spike.obj")));
+    // The dialog filter and the drop handler admit the same set, so a format that
+    // can be dragged cannot be hidden by the Open panel.
+    let offered = import::importable_extensions();
+    for ext in import::SUPPORTED_EXTENSIONS
+        .into_iter()
+        .chain(import::CONVERTIBLE_EXTENSIONS)
+    {
+        assert!(offered.contains(&ext), "the dialog filter omits .{ext}");
+    }
+    assert_eq!(offered.len(), 10, "the two lists and the filter must agree");
+}
+
+#[test]
 fn the_supported_list_matches_the_hint_the_panel_shows() {
-    // The panel renders this string next to the path box; a format added to the
-    // reader but not to the list would be invisible, and vice versa.
-    assert_eq!(import::supported_hint(), ".obj, .stl, .gltf or .glb");
+    // The panel renders this string next to the path box; a format added to either
+    // list but not named in the hint would be invisible to the user, and vice
+    // versa. The exact wording is pinned by a unit test in `src/import.rs`; what
+    // belongs here is the cross-check between the lists and the sentence, which is
+    // the pair that can drift apart.
+    let hint = import::supported_hint();
+    for ext in import::SUPPORTED_EXTENSIONS
+        .into_iter()
+        .chain(import::CONVERTIBLE_EXTENSIONS)
+    {
+        assert!(
+            hint.contains(&format!(".{ext}")),
+            "the hint the panel shows omits .{ext}: {hint}"
+        );
+    }
+    assert!(
+        hint.contains("Blender") || hint.contains("assimp"),
+        "a converted format has to be described as converted, not promised like the \
+         formats read in this process: {hint}"
+    );
     assert!(import::is_supported(&fixture("spike.obj")));
     assert!(import::is_supported(&fixture("diamond.stl")));
     assert!(import::is_supported(&PathBuf::from("UPPER.OBJ")));

@@ -104,9 +104,6 @@ const IMPORT_PALETTE: [[f32; 3]; 4] = [
     [0.36, 0.78, 0.6],
     [0.66, 0.42, 0.85],
 ];
-/// Gloss of an imported body: mid-range, because a file's material properties
-/// are not read and a value at either extreme reads as a mistake.
-const IMPORT_GLOSS: f32 = 0.35;
 /// The collision radius factor for an import. Every built-in primitive has a
 /// tuned factor below 1 because its mesh does not fill its bounding sphere; an
 /// import is normalised *to* that sphere (rule 2 of [`import`]), so 1.0 is not an
@@ -146,6 +143,12 @@ struct Settings {
     /// next attempt, because a truncation notice that vanishes in one frame is a
     /// notice nobody reads.
     import_note: String,
+    /// The conversion still running and how many files wait behind it, rebuilt from the
+    /// queue every frame. `import_note` is one slot that anything else overwrites, so
+    /// busy-ness needs somewhere that cannot go stale: otherwise a conversion taking ten
+    /// seconds stops being mentioned after the first frame, and a count appended to the
+    /// note reads as part of some other file's result.
+    import_converting: Option<(String, usize)>,
     /// The file being dragged over the window right now, if any: the affordance
     /// that says a drop will import rather than do nothing.
     hovered_file: Option<String>,
@@ -289,6 +292,17 @@ pub struct App {
     /// Files waiting for a device: queued from the command line before there is a
     /// window, and by a drag at any time.
     pending: Vec<PathBuf>,
+    /// Imports whose conversion is running on a worker thread, one receiver each.
+    ///
+    /// A format with no reader in this process is converted by an external tool,
+    /// which costs seconds — and the thread that would wait for it is the one that
+    /// draws the room. So the slow formats go away from the frame and answer here on
+    /// a later one, exactly like the file dialog above. In-process formats stay
+    /// synchronous: they are milliseconds, and deferring them would only make the
+    /// panel lie about when something arrived. Each entry carries the file's name with
+    /// its receiver, because a failure has to say which file failed and the panel has to
+    /// say what is running now.
+    converting: Vec<(String, mpsc::Receiver<Result<Import, String>>)>,
     effects: Effects,
     history: History,
     grab: Option<Grab>,
@@ -432,6 +446,7 @@ impl App {
                 spawn_random: true,
                 import_draft: String::new(),
                 import_note: String::new(),
+                import_converting: None,
                 hovered_file: None,
                 shadows: true,
                 trails: false,
@@ -446,6 +461,7 @@ impl App {
             step_requests: 0,
             imports: Vec::new(),
             pending: Vec::new(),
+            converting: Vec::new(),
             effects: Effects::default(),
             history: History::default(),
             grab: None,
@@ -699,6 +715,46 @@ impl App {
         settings.import_note = "cleared every body".to_owned();
     }
 
+    /// Drain the conversions that have answered, leaving the ones that have not.
+    ///
+    /// Split out of the frame loop so the rules below are testable rather than merely
+    /// commented: a frame that polls must never wait on a slow conversion, and two
+    /// details carry weight. `retain_mut` walks in the order the receivers were pushed,
+    /// so a batch that finishes inside one frame is applied in the order the files were
+    /// dropped rather than the order the tools happened to finish in; and a disconnected
+    /// receiver becomes an error rather than silence, because a worker that panicked
+    /// would otherwise leave the panel saying *converting …* for the rest of the
+    /// session. The file's name lives in the vector with its receiver so the answer
+    /// that cannot name one — a dead worker — can be told which file it was, at the
+    /// point where that message is made. The other answers already name their file:
+    /// every `ImportError` variant prints a stem or a path, and a caller that wrapped
+    /// them in the path too read "…/scene.blend: scene: cannot convert .blend: …" in a
+    /// panel 360 px wide.
+    fn take_finished(
+        converting: &mut Vec<(String, mpsc::Receiver<Result<Import, String>>)>,
+    ) -> Vec<Result<Import, String>> {
+        let mut finished = Vec::new();
+        converting.retain_mut(|(name, receiver)| match receiver.try_recv() {
+            Ok(result) => {
+                finished.push(result);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The only answer of the three that has no way to name its file: every
+                // `ImportError` variant already prints a stem or a path, so the caller
+                // that shows this must not add one — a panel 360 px wide would read
+                // "/Users/me/m/scene.blend: scene: cannot convert .blend: …". This one
+                // names itself here, where the name is actually missing.
+                finished.push(Err(format!(
+                    "{name}: the conversion thread ended without an answer"
+                )));
+                false
+            }
+        });
+        finished
+    }
+
     /// Read a file from disk and report the outcome in the panel, whether that
     /// outcome is geometry or a reason it was refused.
     fn import_one(
@@ -749,7 +805,7 @@ impl App {
         shapes.push(ShapeDef {
             mesh: import.mesh,
             color: body_color,
-            gloss: import.gloss.unwrap_or(IMPORT_GLOSS),
+            gloss: import.gloss.unwrap_or(import::DEFAULT_GLOSS),
         });
         gpu.shape_mesh.push(handle);
         // The impact-ring palette is indexed by shape, so an imported body that
@@ -1238,6 +1294,7 @@ impl App {
             present_note,
             imports,
             pending,
+            converting,
             effects,
             history,
             grab,
@@ -1415,6 +1472,21 @@ impl App {
         }
         if req.clear {
             App::clear_all(settings, world, shapes, &mut gpu.shape_mesh, imports);
+            // Nothing asked for a body any more, so neither the queue nor the answers
+            // still coming back. Dropping a receiver is the whole cancellation: the
+            // worker's `send` then fails, and it already ignores that. It does not stop
+            // the tool that is already running — `run_capped` polls a child process with
+            // no cancellation hook — so a Blender started a second ago finishes its
+            // conversion and throws the result away, holding its own CPU and temp
+            // directory until it does. Stopping it would mean a flag the poll loop reads;
+            // for a control this rare, discarding the answer is the cheaper honest half.
+            converting.clear();
+            // Queued but not yet started, which is the window a drop leaves open: the
+            // drop handler runs between frames, and `x` is handled in the same draw as
+            // the queue below, so a file dropped just before the press would otherwise
+            // be imported into the room that has just been emptied.
+            pending.clear();
+            settings.import_converting = None;
             // The snapshots refer to shapes that have just been released.
             history.clear();
             if settings.primitive_hulls {
@@ -1434,7 +1506,7 @@ impl App {
             let (answer, receiver) = mpsc::channel();
             let picking = rfd::AsyncFileDialog::new()
                 .set_title("Import an object")
-                .add_filter("3D objects", &import::SUPPORTED_EXTENSIONS)
+                .add_filter("3D objects", &import::importable_extensions())
                 .set_parent(window.as_ref())
                 .pick_files();
             std::thread::spawn(move || {
@@ -1517,12 +1589,65 @@ impl App {
         // one needs the device, the shape table, the colour list and the world at
         // the same time, which is exactly what the borrow-splitting above forbids.
         // Anything still queued when there was no device stays queued: a
+        // Answers first, and only those: nothing here waits. Before the queue, so the
+        // frame a conversion lands in is the frame the next queued file starts — the
+        // other order costs one idle frame per queued file, and changes nothing else.
+        for result in App::take_finished(converting) {
+            match result {
+                Ok(import) => {
+                    App::add_import(settings, world, shapes, gpu, imports, import);
+                }
+                Err(e) => settings.import_note = format!("✗ {e}"),
+            }
+        }
+
         // `--import` on the command line lands on the first frame that has one.
         let mut queued = std::mem::take(pending);
         queued.extend(req.imports.iter().cloned());
+        let mut waiting = Vec::new();
         for path in queued {
+            if import::needs_converter(&path) {
+                // One conversion at a time, the rest left in `pending` in the order they
+                // arrived. Blender's start-up dominates the cost of a conversion, so ten
+                // running at once make each one slower than if they had queued, hold ten
+                // scenes' worth of memory for the results, and can each run to the 120 s
+                // ceiling — which is what dragging a fistful of `.fbx` files off Finder
+                // would otherwise do.
+                if !converting.is_empty() {
+                    waiting.push(path);
+                    continue;
+                }
+                // Off the frame thread, answered on a later one. The message is
+                // written when the work starts, not when it lands: a conversion
+                // that takes ten seconds has to say what it is busy with, or it is
+                // indistinguishable from the window having frozen.
+                let (answer, receiver) = mpsc::channel();
+                let name = path.display().to_string();
+                settings.import_note = format!(
+                    "converting {name} — this format has no reader in the app, so an \
+                     external tool has to look at it and that takes a few seconds"
+                );
+                std::thread::spawn(move || {
+                    let _ = answer.send(import::import_path(&path).map_err(|e| e.to_string()));
+                });
+                // The name travels with the receiver: a failure has to say which file
+                // failed once more than one is in the queue, and the panel has to say
+                // what is busy right now without depending on a note nothing owns.
+                converting.push((name, receiver));
+                continue;
+            }
             App::import_one(settings, world, shapes, gpu, imports, &path);
         }
+        // Deferred work goes back where the next frame will find it, in order.
+        pending.extend(waiting);
+        // Rebuilt every frame rather than appended to `import_note`: that is one slot,
+        // and whatever else wrote it — a successful in-process import, a refusal — would
+        // end up carrying a conversion's queue count as if it belonged to it. This line
+        // is the panel admitting the room was asked for more than one thing at a time,
+        // for as long as that stays true.
+        settings.import_converting = converting
+            .first()
+            .map(|(name, _)| (name.clone(), pending.len()));
         // Frame-steps are asked for here and paid by the *next* frame's physics
         // block, which is what keeps a scrubbed step exactly FRAME_STEP long.
         if req.steps > 0 {
@@ -2205,6 +2330,16 @@ fn hud(
                         ui.label(settings.import_note.as_str());
                     }
                 }
+                // Its own line, for as long as the queue says so — including the frames
+                // after something else wrote the note above.
+                if let Some((running, queued)) = settings.import_converting.as_ref() {
+                    let waiting = if *queued > 0 {
+                        format!(" · {queued} more queued")
+                    } else {
+                        String::new()
+                    };
+                    ui.label(format!("converting {running}{waiting}"));
+                }
             });
         });
 }
@@ -2227,6 +2362,7 @@ mod tests {
             spawn_random: true,
             import_draft: String::new(),
             import_note: String::new(),
+            import_converting: None,
             hovered_file: None,
             shadows: true,
             trails: false,
@@ -2268,6 +2404,71 @@ mod tests {
         // Refusing an out-of-range draft matters more than accepting it: a
         // wrapping seed would silently mean a room nobody can get back to.
         assert_eq!(parse_seed("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn a_conversion_answers_when_it_is_ready_without_anyone_waiting() {
+        // The frame loop's side of the converter: a poll must never block, answers land
+        // in the order the files were asked for rather than the order the tools finished,
+        // and a worker that died has to surface as a message instead of leaving the panel
+        // promising a conversion for the rest of the session.
+        let (done_answer, done) = mpsc::channel();
+        let (slow_answer, slow) = mpsc::channel::<Result<Import, String>>();
+        let (dead_answer, dead) = mpsc::channel::<Result<Import, String>>();
+        drop(dead_answer);
+        let mut converting = vec![
+            ("a.fbx".to_owned(), done),
+            ("b.fbx".to_owned(), slow),
+            ("c.fbx".to_owned(), dead),
+        ];
+
+        done_answer
+            .send(Ok(Import {
+                mesh: geom::quad_mesh(),
+                source: "first".to_owned(),
+                notes: Vec::new(),
+                dropped_triangles: 0,
+                hull: None,
+                gloss: None,
+            }))
+            .expect("the receiver is still there");
+        // `slow_answer` deliberately holds nothing yet: that receiver stands for a
+        // conversion still running when the frame polls.
+
+        // Answers come back in the order the files were queued, not the order the tools
+        // finished: the import palette, the shape indices and the note the user reads all
+        // follow that order. The dead worker reports on this same poll — it has nothing
+        // left to wait for — while the in-flight one keeps its receiver.
+        let first = App::take_finished(&mut converting);
+        assert_eq!(first.len(), 2, "the answered one and the dead one: {first:?}");
+        assert_eq!(converting.len(), 1, "the one that has not answered is left alone");
+        assert!(matches!(first[0], Ok(_)), "the file queued first is applied first");
+        assert_eq!(
+            first[1].as_ref().err().map(String::as_str),
+            Some("c.fbx: the conversion thread ended without an answer"),
+            "a worker that died has to be reported, not left promising a conversion"
+        );
+
+        // A second poll of the same frame finds nothing new and, above all, does not
+        // wait: the remaining conversion is still in flight.
+        assert!(
+            App::take_finished(&mut converting).is_empty(),
+            "an in-flight conversion is not an error, and not a reason to block"
+        );
+
+        // Then it answers, on whatever frame happens to be polling.
+        slow_answer
+            .send(Err("second gave up".to_owned()))
+            .expect("the receiver is still there");
+        let later = App::take_finished(&mut converting);
+        assert_eq!(
+            later.first()
+                .and_then(|r| r.as_ref().err())
+                .map(String::as_str),
+            Some("second gave up"),
+            "a conversion that failed is an answer, not a silence"
+        );
+        assert!(converting.is_empty(), "and its receiver is gone");
     }
 
     #[test]
@@ -2595,7 +2796,7 @@ mod tests {
         shapes.push(ShapeDef {
             mesh: geom::quad_mesh(),
             color: [0.5, 0.5, 0.5],
-            gloss: IMPORT_GLOSS,
+            gloss: import::DEFAULT_GLOSS,
         });
         let mut handles: Vec<usize> = (0..shapes.len()).collect();
         let mut imports = sample_imports();

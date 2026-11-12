@@ -41,9 +41,11 @@ probe [options]
   --seconds S        simulated seconds before the shutter (default: 2.2)
   --front-face V     only render this room winding: cw | ccw | both (default: both)
   --keep-rings       draw impact rings (on by default; --no-rings to drop)
-  --import PATH      put an imported object (.obj, .stl, .gltf, .glb) in the scene and
-                     require it to show up too; repeatable
-  --wireframe    draw the edge overlay as well as the solids (the visibility
+  --import PATH      put an imported object in the scene and require it to show up
+                     too; repeatable. Read in this process: .obj, .stl, .gltf, .glb.
+                     Converted by Blender or assimp first, which costs seconds:
+                     .fbx, .blend, .usd, .usda, .usdc, .usdz
+  --wireframe        draw the edge overlay as well as the solids (the visibility
                      check reads solid pixels either way)
   --gif S            then record S more seconds as an animated GIF beside the PNG
   --no-hulls         imports collide as spheres instead of convex hulls
@@ -289,12 +291,19 @@ fn main() {
     // The probe keeps its own colour for an import rather than reading the app's,
     // for the same reason it keeps its own lights: a shared constant that is wrong
     // cancels out in a check that uses it.
+    //
+    // Gloss is the exception, and the exception has a reason: an import with no
+    // material is not the probe's aesthetic choice to make, it is the app's default,
+    // and these pictures go in the README as what the app looks like. The probe drew
+    // imports with a stale copy of that default — 0.35, long after the app had moved
+    // to 40.0 — and the imported objects in the committed screenshots were waxy for
+    // exactly the reason the app constant was changed.
     for import in imports.iter() {
         shapes.push(geom::ShapeDef {
             mesh: import.mesh.clone(),
             // A mesh with colours of its own is drawn in them.
             color: if import.mesh.colors.is_some() { [1.0; 3] } else { [0.78, 0.8, 0.85] },
-            gloss: import.gloss.unwrap_or(0.35),
+            gloss: import.gloss.unwrap_or(import::DEFAULT_GLOSS),
         });
     }
     // Colliders, index-aligned with `shapes`: nothing for the built-ins unless

@@ -6,27 +6,58 @@
 //! [`Gfx::upload_mesh`](crate::gfx::Gfx::upload_mesh), and one
 //! [`crate::sim::Body`] bouncing around with the rest of them.
 //!
-//! # What is supported, and why these two
+//! # What is supported, and how
 //!
-//! `.obj` (Wavefront) and `.stl` (stereolithography) are text-and-triangle
-//! formats with no scene semantics, so they can be read inside this process.
-//! `.obj` goes through `tobj`, which is worth one small dependency for the parts
-//! that are easy to get wrong by hand: the four forms of a face element
-//! (`v`, `v/vt`, `v//vn`, `v/vt/vn`), negative indices, and fan-triangulating
-//! polygons of arbitrary arity. `.stl` is parsed here because an STL is nothing
-//! but a triangle soup, and because the interesting part of supporting it —
-//! welding — is the same code path every format needs.
+//! Four formats are read inside this process: `.obj` (Wavefront) and `.stl`
+//! (stereolithography) are text-and-triangle formats with no scene semantics;
+//! `.gltf` and `.glb` are read through the `gltf` crate, whose buffers this module
+//! resolves itself because the crate does not touch the filesystem. `.obj` uses
+//! `tobj` rather than a hand parser for the parts that go wrong quietly: the four
+//! forms of a face element (`v`, `v/vt`, `v//vn`, `v/vt/vn`), negative indices, and
+//! fan-triangulating polygons of arbitrary arity. `.stl` is parsed here because an
+//! STL is a triangle soup, and because the interesting part of supporting it —
+//! welding — is the path every format shares.
 //!
-//! `.fbx`, `.blend`, `.usd` and `.usdz` are deliberately not attempted. FBX is a
-//! binary AST with several mutually incompatible dialects, `.blend` is a
-//! self-describing blob whose layout tracks Blender's own DNA version, and USD is
-//! a *composition* system where the visible geometry may be instanced,
-//! inherited across layers, or refined from a proxy — so "read the mesh" means
-//! implementing a resolver. There is no maintained Rust reader for any of them.
-//! The seam is [`import_path`]: a converter can be added there (Blender and
-//! assimp both read all six and write OBJ) without the app layer noticing, and
-//! everything below — welding, normalising, the index budget, the wireframe
-//! edges — is format-agnostic and already works for whatever lands there.
+//! `.fbx`, `.blend` and the USD family (`.usd`, `.usda`, `.usdc`, `.usdz`) are
+//! **converted, not parsed**, and the distinction is honest rather than a hedge:
+//! FBX is a binary AST with several mutually incompatible dialects, `.blend` is a
+//! self-describing blob whose layout tracks Blender's own DNA version, and USD is a
+//! *composition* system where the geometry you see may be instanced, inherited
+//! across layers or refined from a proxy — so "read the mesh" means implementing a
+//! resolver. No maintained Rust reader exists for any of them. So the file is run
+//! through Blender headless, which writes a self-contained `.glb`, and the result
+//! goes into the same glTF reader. Everything downstream of that — welding,
+//! normalising, the index budget, edges, hulls — is format-agnostic and never
+//! notices the difference.
+//!
+//! What the tools can actually do was measured, not assumed:
+//!
+//! | Format | Recipe | Fallback |
+//! | --- | --- | --- |
+//! | `.blend` | `blender -b file.blend --python-expr` → GLB | none |
+//! | `.fbx` | `blender -b --python-expr` with `wm.fbx_import` | `assimp export` |
+//! | `.usd`, `.usda`, `.usdc`, `.usdz` | `blender -b --python-expr` with `wm.usd_import` | none |
+//!
+//! assimp is a fallback for FBX only, and the reason is worth recording because it
+//! looks like a bug when you first hit it: `assimp export modern.blend` fails with
+//! "BLENDER magic bytes are missing, couldn't find GZIP header either", because
+//! assimp's Blender loader predates the file format Blender 2.8+ writes. And
+//! `blender -b file.fbx` — passing the file as an argument, the way `.blend` is
+//! passed — fails with "File format is not supported", because FBX is an *addon
+//! import* rather than something the .blend loader understands; the import operator
+//! has to be called explicitly. Both of those are why the recipes differ per
+//! format rather than one command line for everything.
+//!
+//! A machine with no Blender and no assimp gets an error that says so and names the
+//! variables that would point at them (`BLENDER`, `ASSIMP`); nothing is installed
+//! behind the user's back. Conversion is slow — seconds, not milliseconds — so the
+//! window layer runs it on a worker thread rather than in the frame — the same
+//! shape it already uses for the file dialog; the probe calls the blocking path
+//! directly, which is what makes a headless `.fbx` check possible.
+//!
+//! Conversion also loses whatever the source format carries that glTF cannot say,
+//! and adds whatever the converter decides about units and up-axis. That is reported
+//! in `Import::notes` rather than left silent.
 //!
 //! # The four rules every import obeys
 //!
@@ -55,7 +86,7 @@
 //!    would show nothing at all for an imported object.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::hull::Hull;
 use crate::geom::{Mesh, Vertex};
@@ -78,6 +109,458 @@ const WELD_QUANTUM: f32 = 1.0e-5;
 
 /// Extensions this module can read, for the HUD and for argument checking.
 pub const SUPPORTED_EXTENSIONS: [&str; 4] = ["obj", "stl", "gltf", "glb"];
+/// Extensions with no reader in this process, which [`import_path`] accepts only
+/// because it converts them to glTF with an external tool first. See the module
+/// note for which tool converts which format, and what was measured about it.
+pub const CONVERTIBLE_EXTENSIONS: [&str; 6] = ["fbx", "blend", "usd", "usda", "usdc", "usdz"];
+
+/// Every extension [`is_supported`] accepts, in the order a file dialog should
+/// show them: the formats this process reads, then the ones that need a tool. The
+/// window layer hands this to `rfd`, and it has to be the same set the drop
+/// handler admits — a dialog that hides `.fbx` while a dragged `.fbx` imports is
+/// the same inconsistency as the reverse, only quieter.
+pub fn importable_extensions() -> Vec<&'static str> {
+    SUPPORTED_EXTENSIONS
+        .into_iter()
+        .chain(CONVERTIBLE_EXTENSIONS)
+        .collect()
+}
+
+/// Wall-clock ceiling on one conversion.
+///
+/// Measured on this machine: a cube through Blender 5.0 is about a second per launch,
+/// which is why the window layer puts conversion on a worker thread instead of in the
+/// frame. A heavy scene was never measured, and this ceiling is not for one — it is
+/// there because a tool that wedges on a malformed file would otherwise hold a worker
+/// thread until the process ends. 120 s is far above anything this machine has
+/// produced and short enough that a wedged Blender gets reported rather than waited on
+/// forever.
+pub const MAX_CONVERT_SECONDS: u64 = 120;
+
+/// True for a format that must be converted before it can be read. The window
+/// layer asks this before deciding whether an import is cheap enough to do inside
+/// the frame or belongs on a worker thread — a conversion takes seconds, and the
+/// frame thread is the one that draws.
+pub fn needs_converter(path: &Path) -> bool {
+    extension(path).is_some_and(|e| CONVERTIBLE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Where Blender lives. `BLENDER` names it explicitly, then `blender` on `PATH`,
+/// then the macOS application bundle. `None` is not an error: it means this
+/// machine cannot convert, and the caller says so in words rather than installing
+/// anything behind the user.
+pub fn blender_program() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("BLENDER") {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for name in ["blender", "blender-5.0", "blender-lts"] {
+        if which(name) {
+            return Some(PathBuf::from(name));
+        }
+    }
+    let app = PathBuf::from("/Applications/Blender.app/Contents/MacOS/Blender");
+    app.exists().then_some(app)
+}
+
+/// Where assimp lives, for the FBX fallback. `ASSIMP` names it explicitly.
+pub fn assimp_program() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("ASSIMP") {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    which("assimp").then(|| PathBuf::from("assimp"))
+}
+
+/// Is `name` on `PATH`? Hand-rolled so this module adds no dependency: walk the
+/// `PATH` entries and look for an executable file of that name.
+fn which(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+            && candidate
+                .metadata()
+                .map(|m| {
+                    #[cfg(unix)]
+                    let executable = {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode() & 0o111 != 0
+                    };
+                    #[cfg(not(unix))]
+                    let executable = true;
+                    executable
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// Run a converter, killing it if it outlives [`MAX_CONVERT_SECONDS`].
+///
+/// `std::process` has no wait-with-timeout, so this polls `try_wait`; a 50 ms
+/// grain is invisible beside a Blender start-up. The tool's own output is dropped:
+/// a converter writing to a pipe nobody drains is another way a conversion becomes
+/// a hang, and its progress bars are not something a HUD can show.
+///
+/// Arguments and env values are owned `OsString`s rather than `&OsStr` borrows,
+/// which costs a handful of clones per conversion and buys the one thing that
+/// matters here: an argument built inside a match arm — the Python source of a
+/// `--python-expr` recipe — outlives the arm that made it.
+fn run_capped(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    envs: &[(&str, std::ffi::OsString)],
+) -> Result<(), String> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (*k, v)))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let budget = std::time::Duration::from_secs(MAX_CONVERT_SECONDS);
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status
+                    .success()
+                    .then_some(())
+                    .ok_or_else(|| format!("{} exited with {status}", program.display()))
+            }
+            Ok(None) => {
+                if started.elapsed() > budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{} did not finish in {MAX_CONVERT_SECONDS} s and was stopped",
+                        program.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                // Stop it and reap it, the same way the timeout path does: a child left
+                // running after this is a Blender still converting into a directory that
+                // is about to be deleted, and an unreaped one is a zombie for the rest of
+                // this process.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for {}: {e}", program.display()));
+            }
+        }
+    }
+}
+
+/// The tail every Blender recipe shares: write a self-contained GLB at the path
+/// `BR_OUT` names. Kept as one string rather than repeated in two places, because
+/// it is the half of the script that must stay exactly right for the reader that
+/// consumes the result.
+const GLB_EXPORT: &str =
+    "bpy.ops.export_scene.gltf(filepath=os.environ['BR_OUT'], export_format='GLB')";
+
+/// The Python Blender runs for the recipes that go through `--python-expr`.
+///
+/// `Some(op)` is the two-step case FBX and USD need: open the file through the
+/// addon import operator, then export. `None` is `.blend`, where Blender's own
+/// loader has already opened the file before this runs, so only the export is left.
+///
+/// The paths travel as environment variables, never inside the program text. A
+/// filename is user input on a drag-and-drop path, and this is source the
+/// interpreter executes: quoting it in is how an apostrophe in someone's folder
+/// name becomes a syntax error at best, and — if the quoting is ever half-finished
+/// — an injection at worst.
+fn blender_script(import_op: Option<&str>) -> String {
+    match import_op {
+        Some(op) => format!(
+            "import bpy, os\nbpy.ops.{op}(filepath=os.environ['BR_IN'])\n{GLB_EXPORT}"
+        ),
+        None => format!("import bpy, os\n{GLB_EXPORT}"),
+    }
+}
+
+/// How a format with no reader in this process gets turned into glTF bytes. One
+/// variant per real command line, measured against the tools rather than reasoned
+/// out from their documentation — the module note records what was found.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Recipe {
+    /// `blender -b <file> --python-expr …`: Blender's own loader opens the file
+    /// first, which only works for formats it really loads.
+    BlenderOpen,
+    /// `blender -b --python-expr …` with an explicit addon import, which is what
+    /// FBX and USD need because the .blend loader refuses them outright.
+    ///
+    /// The operator name is spelled out because Blender moves these between
+    /// categories between versions, and the symmetric-looking guess is not there:
+    /// Blender 5.0 has `wm.fbx_import` and `wm.usd_import`, and has no
+    /// `wm.fbx_export` at all — its FBX writer is `export_scene.fbx`.
+    BlenderImport(&'static str),
+    /// `assimp export <file> <out>`, for a machine with no Blender. FBX only: see
+    /// [`recipes_for`].
+    Assimp,
+}
+
+/// The recipes tried for one extension, in order.
+///
+/// Every convertible extension is named rather than defaulted, because a catch-all arm
+/// would quietly hand the next format added to [`CONVERTIBLE_EXTENSIONS`] the USD
+/// recipe — and the failure it produced would never mention that the recipe table was
+/// never extended. `&[]` is "no converter here", which is what the error then says.
+///
+/// `.blend` has no fallback: assimp's Blender loader predates the file format
+/// Blender 2.8+ writes and says so itself — measured on this machine as "BLENDER
+/// magic bytes are missing, couldn't find GZIP header either".
+fn recipes_for(ext: &str) -> &'static [Recipe] {
+    match ext {
+        "blend" => &[Recipe::BlenderOpen],
+        "fbx" => &[
+            Recipe::BlenderImport("wm.fbx_import"),
+            Recipe::Assimp,
+        ],
+        "usd" | "usda" | "usdc" | "usdz" => &[Recipe::BlenderImport("wm.usd_import")],
+        _ => &[],
+    }
+}
+
+/// A scratch directory that deletes itself when the guard goes out of scope.
+///
+/// The invariant — the converted file is gone when the import ends, whichever way the
+/// import ended — is easy to state and easy to break one `return` at a time, and
+/// `convert_with` already has several exits before anyone adds another. A panic that
+/// unwinds still runs this; an abort from inside a library does not, which is why the
+/// converter's *output* is size-checked before a single byte of it is read
+/// ([`convert_with`]) rather than left to the glTF reader to survive.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Convert one of the unparseable formats into glTF bytes with whatever this
+/// machine has, trying [`recipes_for`] in order. And report which tool did it, so
+/// the import can say what happened to it.
+fn convert_to_gltf(path: &Path, ext: &str) -> Result<(Vec<u8>, String), ImportError> {
+    convert_with(path, ext, recipes_for(ext))
+}
+
+/// The conversion, with the recipe list supplied by the caller.
+///
+/// That seam exists because the assimp row of [`recipes_for`] is only reached when
+/// Blender is missing or fails, so on a machine that has Blender — every development
+/// machine that tests this — nothing would ever run it. A fallback nobody runs is a
+/// fallback that quietly stops working, and `assimp_falls_back_for_a_real_fbx` below
+/// forces the list to prove it still does.
+///
+/// The temp directory lives only as long as this call, and is created **exclusively**.
+///
+/// Nothing downstream keeps the path (`Import::source` is a stem, and `Mesh::name` is
+/// the static string "imported"), and leaving converted files in `/tmp` forever is a
+/// leak that only shows up as a full disk a month later — hence [`Scratch`]. The name
+/// carries the process id, an attempt counter and the extension so imports in flight
+/// cannot collide, and the counter is stepped until `create_dir` succeeds, because
+/// `create_dir` refuses a path that already exists: a directory — or a symlink to
+/// somewhere else — that another local process planted under this name gets skipped
+/// rather than adopted, which matters because the converter is then told to write its
+/// output there. This buys exclusivity, not secrecy: another local user can still
+/// *read* the converted file, since a temp directory is world-traversable by the
+/// usual umask. Nothing this app writes into it is worth reading by someone else.
+fn convert_with(
+    path: &Path,
+    ext: &str,
+    recipes: &[Recipe],
+) -> Result<(Vec<u8>, String), ImportError> {
+    let source = stem(path);
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut dir = PathBuf::new();
+    let mut failure = String::new();
+    for _ in 0..8 {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "bouncing-room-convert-{}-{attempt}-{ext}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            // `create_dir`, not `create_dir_all`: the exclusive form, which fails on a
+            // name that already exists — including one that is a symlink.
+            Ok(()) => {
+                dir = candidate;
+                break;
+            }
+            Err(e) => failure = e.to_string(),
+        }
+    }
+    if dir.as_os_str().is_empty() {
+        return Err(ImportError::Bad {
+            source,
+            reason: format!(
+                "could not make a temporary directory of our own under {} ({failure})",
+                std::env::temp_dir().display()
+            ),
+        });
+    }
+    // The directory now deletes itself on every exit, including a panic.
+    let scratch = Scratch(dir);
+    let out = scratch.0.join(format!("{source}.glb"));
+    // Owned, because each recipe arm below clones these into its own argument list.
+    let out_os = out.as_os_str().to_owned();
+    let in_os = path.as_os_str().to_owned();
+
+    let mut attempts = Vec::new();
+    for recipe in recipes {
+        let (program, args, envs, label): (
+            PathBuf,
+            Vec<std::ffi::OsString>,
+            Vec<(&str, std::ffi::OsString)>,
+            &str,
+        ) = match recipe {
+            Recipe::BlenderOpen => match blender_program() {
+                Some(p) => (
+                    p,
+                    vec![
+                        "-b".into(),
+                        in_os.clone(),
+                        "--python-expr".into(),
+                        blender_script(None).into(),
+                    ],
+                    vec![("BR_OUT", out_os.clone())],
+                    "Blender",
+                ),
+                None => {
+                    attempts.push("Blender: not found".to_owned());
+                    continue;
+                }
+            },
+            Recipe::BlenderImport(op) => match blender_program() {
+                Some(p) => (
+                    p,
+                    vec![
+                        "-b".into(),
+                        "--python-expr".into(),
+                        blender_script(Some(op)).into(),
+                    ],
+                    vec![("BR_IN", in_os.clone()), ("BR_OUT", out_os.clone())],
+                    "Blender",
+                ),
+                None => {
+                    attempts.push("Blender: not found".to_owned());
+                    continue;
+                }
+            },
+            Recipe::Assimp => match assimp_program() {
+                Some(p) => (
+                    p,
+                    vec!["export".into(), in_os.clone(), out_os.clone()],
+                    Vec::new(),
+                    "assimp",
+                ),
+                None => {
+                    attempts.push("assimp: not found".to_owned());
+                    continue;
+                }
+            },
+        };
+        // Start every recipe from no output at all, because the output path is shared
+        // between them. A Blender killed at the timeout can leave a half-written `.glb`
+        // behind; the assimp attempt that follows exits 0 without writing anything when
+        // it only half-reads the source, and would have Blender's truncated bytes read
+        // back as its own result — geometry credited to the wrong tool.
+        let _ = std::fs::remove_file(&out);
+        match run_capped(&program, &args, &envs) {
+            Ok(()) => {}
+            Err(e) => {
+                attempts.push(format!("{label}: {e}"));
+                continue;
+            }
+        }
+        // What has to be bounded is the converter's *output*, not the file it was
+        // handed. `MAX_FILE_BYTES` gates the source of every format read in this
+        // process, and a converted source is never read here at all: a few megabytes of
+        // `.usdz` — a zip archive — or a `.blend` full of procedural objects can come
+        // out as a hundred times that in glTF. Checked before the read, so those bytes
+        // never enter this process, and no later recipe is tried: the second tool would
+        // write a comparably large file and cost another start-up to say the same thing.
+        if let Ok(meta) = std::fs::metadata(&out) {
+            if meta.len() > MAX_FILE_BYTES {
+                let from = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                // One decimal, because a 900 kB source that came out as 70 MB of glTF is
+                // the surprising part, and whole megabytes would report it as 0 into 67.
+                let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+                // Returned on its own rather than joined into `attempts`, because the
+                // advice that follows a failed conversion — set `BLENDER`, set `ASSIMP` —
+                // is wrong here: the tool ran, and did exactly what it was asked. The
+                // [`Scratch`] guard still removes the directory on the way out.
+                return Err(ImportError::Bad {
+                    source,
+                    reason: format!(
+                        "{label} turned {:.1} MiB of .{ext} into {:.1} MiB of glTF, past this \
+                         app's {} MiB input limit — decimate the scene, or export a smaller \
+                         glTF from the source's own tool",
+                        mib(from),
+                        mib(meta.len()),
+                        MAX_FILE_BYTES / (1 << 20)
+                    ),
+                });
+            }
+        }
+        match std::fs::read(&out) {
+            Ok(bytes) if !bytes.is_empty() => return Ok((bytes, label.to_owned())),
+            Ok(_) => attempts.push(format!("{label} wrote an empty file")),
+            Err(e) => attempts.push(format!("{label} produced no readable output: {e}")),
+        }
+    }
+
+    // Two different empties. No recipe at all means this file has an extension in
+    // [`CONVERTIBLE_EXTENSIONS`] that [`recipes_for`] never heard of — a mistake in the
+    // code, and pointing the user at `BLENDER`/`ASSIMP` would send them off to fix
+    // something that is already fine. No attempt *succeeded* means the tools were tried
+    // or missing, which is what the message about variables is for.
+    let tried = if recipes.is_empty() {
+        "this app has no conversion recipe for it (a format in CONVERTIBLE_EXTENSIONS \
+         that recipes_for does not name)"
+            .to_owned()
+    } else if attempts.is_empty() {
+        "no converter is available on this machine".to_owned()
+    } else {
+        attempts.join("; ")
+    };
+    Err(ImportError::Bad {
+        source,
+        reason: format!(
+            "cannot convert .{ext}: {tried}. Set BLENDER or ASSIMP to point at a \
+             converter, or export the file to .gltf or .glb from its own tool"
+        ),
+    })
+}
+
+/// The specular exponent an import draws with when its format carries no
+/// material: the OBJ and STL path, and a glTF with no PBR block.
+///
+/// [`Import::gloss`] says the caller picks, and every caller has picked the same
+/// number ever since the first one — the window layer and the render probe each
+/// kept their own copy, which is how a single wrong value ended up in the app *and*
+/// in the screenshots meant to catch it. So the pick lives here, beside the scale it
+/// is meant to sit in.
+///
+/// That scale is the one the shader works in: [`crate::geom::PRIMITIVE_GLOSS`] spans
+/// 15..92 for the built-in shapes and a glTF roughness maps to 8..96 (the
+/// `roughness_factor` line in the glTF reader), so a plausible neutral belongs near
+/// the middle.
+///
+/// The value was 0.35 for most of the port's life, which was wrong twice over: it
+/// reads like a roughness fraction rather than an exponent, and at 0.35 the shader's
+/// `pow(ndh, gloss)` is close to 1 for *every* half-vector, so an imported part got a
+/// specular wash across its whole surface instead of a highlight. Imported spikes
+/// looked waxy beside primitives of the same shape, and nobody noticed until the
+/// glTF path put the real range on paper.
+pub const DEFAULT_GLOSS: f32 = 40.0;
 
 /// One file, read and made safe for this renderer.
 #[derive(Clone, Debug)]
@@ -98,8 +581,9 @@ pub struct Import {
     /// when the mesh is flat enough to enclose no volume, in which case it
     /// collides as its bounding sphere like everything used to.
     pub hull: Option<Hull>,
-    /// Gloss from the file's material, when the format has one (glTF). OBJ and
-    /// STL leave this `None` and the caller picks.
+    /// Gloss from the file's material, when the format has one (glTF). OBJ and STL
+    /// leave this `None`, and the caller picks — with [`DEFAULT_GLOSS`], which is
+    /// where that pick lives and what it took to get right.
     pub gloss: Option<f32>,
 }
 
@@ -122,8 +606,9 @@ impl std::fmt::Display for ImportError {
             ImportError::Io { path, reason } => write!(f, "{path}: {reason}"),
             ImportError::Unsupported { extension } => write!(
                 f,
-                "no reader for .{extension} — .obj, .stl, .gltf and .glb are supported; a converter \
-                 (Blender or assimp) can read .{extension} and write .obj"
+                "no reader for .{extension}, and no converter for it either — read in-process: \
+                 .obj, .stl, .gltf, .glb; converted via an external tool: .fbx, .blend, .usd, \
+                 .usda, .usdc, .usdz"
             ),
             ImportError::Empty { source } => write!(f, "{source}: no triangles"),
             ImportError::Bad { source, reason } => write!(f, "{source}: {reason}"),
@@ -143,19 +628,36 @@ pub fn unsupported_message(path: &Path) -> String {
     .to_string()
 }
 
-/// True if this module can read `path` — judged by extension, because that is
-/// all the callers have to go on before they read a file.
+/// True if `path` can be imported at all — read in-process or converted. Judged by
+/// extension, because that is all a caller has to go on before it reads anything;
+/// the answer does not depend on whether a converter is installed, so the UI can
+/// offer the format and the attempt explains what was missing.
 pub fn is_supported(path: &Path) -> bool {
-    extension(path).is_some_and(|ext| SUPPORTED_EXTENSIONS.contains(&ext.as_str()))
+    extension(path).is_some_and(|ext| {
+        SUPPORTED_EXTENSIONS.contains(&ext.as_str()) || CONVERTIBLE_EXTENSIONS.contains(&ext.as_str())
+    })
 }
 
-/// The extensions a caller can offer the user, for a hint line.
+/// The extensions a caller can offer the user, for a hint line. The converted
+/// group is marked as such because it is slower and needs a tool the user may not
+/// have — hiding that in a flat list would promise more than the app can always
+/// deliver.
 pub fn supported_hint() -> String {
-    let names: Vec<String> = SUPPORTED_EXTENSIONS.iter().map(|e| format!(".{e}")).collect();
-    match names.split_last() {
-        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
-        _ => names.concat(),
-    }
+    let list = |names: &[&str]| -> String {
+        let named: Vec<String> = names.iter().map(|e| format!(".{e}")).collect();
+        match named.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => named.concat(),
+        }
+    };
+    // "Blender, or assimp for `.fbx`" rather than "Blender or assimp": assimp is only
+    // in the recipe list for one of these extensions (see `recipes_for`), and a hint
+    // that implies otherwise promises a fallback that is not there for the other five.
+    format!(
+        "{} (and {}, converted by Blender, or by assimp for .fbx)",
+        list(&SUPPORTED_EXTENSIONS),
+        list(&CONVERTIBLE_EXTENSIONS)
+    )
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -179,9 +681,53 @@ pub fn import_path(path: &Path) -> Result<Import, ImportError> {
             extension: String::from("(none)"),
         });
     };
-    // Checked before the filesystem is touched, so an unreadable format reports
-    // "no reader for .fbx" rather than "no such file" — the honest answer when
-    // the UI offers six extensions and two of them work.
+    // Decided from the extension before the filesystem is touched, so an
+    // unimportable format answers "no reader for .rar" rather than "no such file".
+    //
+    // A convertible format takes its own path and returns: it is not opened here at
+    // all, because the bytes that matter are the ones the converter writes. The
+    // `MAX_FILE_BYTES` below therefore does not gate a `.blend` at all — the source is
+    // never read into this process. What gates it is the conversion timeout plus the
+    // same `MAX_FILE_BYTES` ceiling applied to whatever the converter wrote
+    // ([`convert_with`]), because a few megabytes of source can come out as many times
+    // that in glTF, and glTF bytes that big are what this reader cannot hold.
+    if CONVERTIBLE_EXTENSIONS.contains(&ext.as_str()) {
+        // The existence check every other format gets for free from the `metadata` call
+        // below, done here first. Otherwise a mistyped path in the panel box —
+        // `scene.blend` where the file is `scene1.blend` — spends a Blender start-up and
+        // answers "cannot convert .blend: Blender exited with exit status 1", which reads
+        // like the app cannot handle the format rather than like a file that is not there.
+        //
+        // It belongs *here*, at the moment of conversion, and not hoisted to the window
+        // layer's queue handler — the natural tidy-up, since it is a cheap check before
+        // spawning a thread. Conversions run one at a time, so a queued path can sit for
+        // minutes while its file is renamed, moved or deleted; asked at queue time, that
+        // file passes the check and then fails inside a converter, and the answer blames
+        // the tool. Asked here, it answers `Io { path, "no such file" }`, naming the path
+        // that stopped existing. Related, and the reason the panel does not prefix failure
+        // lines with the file name: `Unsupported` is the one variant of `ImportError` that
+        // prints no path or stem — only an extension — and every other one already names
+        // the file, so a caller adding a name on top is doubling it.
+        if !path.try_exists().unwrap_or(false) {
+            return Err(ImportError::Io {
+                path: path.display().to_string(),
+                reason: "no such file".to_owned(),
+            });
+        }
+        let (bytes, tool) = convert_to_gltf(path, &ext)?;
+        let mut import = parse_gltf(&bytes, None, &source)?;
+        // Stated up front because it is the thing a user is most likely to be
+        // surprised by: a round trip through a converter is a re-export, and the
+        // converter decides units, up-axis and what survives of a material.
+        import.notes.insert(
+            0,
+            format!(
+                "converted .{ext} to glTF with {tool}: units, up-axis and materials are \
+                 whatever {tool} decided, not what the source file said"
+            ),
+        );
+        return Ok(import);
+    }
     if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
         return Err(ImportError::Unsupported { extension: ext });
     }
@@ -1593,18 +2139,386 @@ f 1 4 6
     }
 
     #[test]
-    fn unsupported_formats_are_named_before_the_filesystem_is_touched() {
-        // A path that does not exist still gets "no reader for .fbx", which is the
-        // honest answer when the menu offers six formats and two work.
-        let path = Path::new("/nonexistent/something.fbx");
+    fn an_unimportable_format_is_named_before_the_filesystem_is_touched() {
+        // A path that does not exist still gets an answer about the format, which is
+        // the honest reply when the UI offers ten extensions and some of them need a
+        // tool this machine may not have.
+        let path = Path::new("/nonexistent/something.rar");
         assert!(!is_supported(path));
         match import_path(path) {
-            Err(ImportError::Unsupported { extension }) => assert_eq!(extension, "fbx"),
+            Err(ImportError::Unsupported { extension }) => assert_eq!(extension, "rar"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
         assert!(is_supported(Path::new("a/b/c.OBJ")));
         assert!(is_supported(Path::new("c.stl")));
-        assert_eq!(supported_hint(), ".obj, .stl, .gltf or .glb");
+        assert!(is_supported(Path::new("x.glb")));
+        assert_eq!(
+            supported_hint(),
+            ".obj, .stl, .gltf or .glb (and .fbx, .blend, .usd, .usda, .usdc or .usdz, \
+             converted by Blender, or by assimp for .fbx)"
+        );
+    }
+
+    #[test]
+    fn a_convertible_format_is_accepted_whatever_is_installed() {
+        // `is_supported` deliberately does not look at the machine: the drop handler
+        // and the file dialog ask it before anything is read, and an answer that
+        // changed with what happens to be installed would make the UI inconsistent.
+        // The missing tool belongs in the failure message instead, in words that say
+        // what to set (see the test after this one).
+        let path = Path::new("/nonexistent/something.fbx");
+        assert!(is_supported(path), ".fbx is importable, by conversion");
+        assert!(needs_converter(path));
+        assert!(!needs_converter(Path::new("x.obj")));
+        // And a path that is simply not there is reported as that, *before* a converter
+        // is started on its way. A Blender that fails on a missing file answers
+        // "cannot convert .fbx: … exited with 1", which reads like the app cannot
+        // handle the format rather than like nobody typed a real path.
+        match import_path(path) {
+            Err(ImportError::Io { reason, .. }) => assert!(
+                reason.contains("no such file"),
+                "a missing file has to be named as missing, not converted: {reason}"
+            ),
+            other => panic!("expected a missing-file error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_converted_names_the_tools_it_needs() {
+        // The half the missing path cannot show: the file is there, the extension is one
+        // this app offers, and the conversion still fails. Whatever is installed — both
+        // tools, one, or neither — the answer has to name what could have read it.
+        let dir = scratch("unreadable");
+        let path = dir.join("nonsense.fbx");
+        std::fs::write(&path, b"not an FBX, whatever the extension claims")
+            .expect("a temp file to fail on");
+        match import_path(&path) {
+            Err(ImportError::Bad { reason, .. }) => assert!(
+                reason.contains("Blender")
+                    || reason.contains("BLENDER")
+                    || reason.contains("assimp"),
+                "a failed conversion has to name the tools: {reason}"
+            ),
+            other => panic!("expected a conversion failure, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The three tests below are the only thing standing between the converter
+    // recipes and a tool that changed under them, and all three skip when the tool is
+    // not on the machine — which is why they say so out loud, and why none of them
+    // treats "the tool is here but the call failed" as a skip. The first version of
+    // this had one test, it guessed a Blender operator name, and the guess made that
+    // test skip quietly while looking green.
+
+    /// A cube, written by Blender five ways: one fixture per convertible extension
+    /// that this Blender can produce. Each write is in its own `try` so a Blender
+    /// without one of the addons prints a reason instead of ending the run, and the
+    /// `.blend` is saved last because `wm.save_as_mainfile` writes the whole scene.
+    const FIXTURE_WRITERS: &str = r#"
+import bpy, os
+out = os.environ['BR_DIR']
+bpy.ops.mesh.primitive_cube_add(size=2)
+for name, op in [
+    ('cube.fbx', 'export_scene.fbx'),
+    ('cube.usd', 'wm.usd_export'),
+    ('cube.usda', 'wm.usd_export'),
+    ('cube.usdz', 'wm.usd_export'),
+    ('cube.blend', 'wm.save_as_mainfile'),
+]:
+    try:
+        group, fn = op.split('.')
+        getattr(getattr(bpy.ops, group, None), fn)(filepath=os.path.join(out, name))
+        print('WROTE', name)
+    except Exception as exc:
+        print('SKIPPED', name, exc)
+"#;
+
+    /// Run one headless Blender over `script` in `dir`, and return what it printed.
+    ///
+    /// Output is captured here and discarded by `run_capped` in the module above,
+    /// deliberately: the app wants a file and has no HUD room for a progress bar,
+    /// while these tests are asking the tool a question, so the answer is the point.
+    /// A script file rather than `--python-expr`, because `try`/`except` in a Rust
+    /// string literal reads as noise.
+    fn blender_run(dir: &Path, script: &str) -> Result<String, String> {
+        let file = dir.join("make.py");
+        std::fs::write(&file, script).map_err(|e| format!("{}: {e}", file.display()))?;
+        let blender = blender_program().expect("the caller checked for Blender");
+        let run = std::process::Command::new(&blender)
+            .arg("-b")
+            .arg("--python")
+            .arg(&file)
+            .env("BR_DIR", dir)
+            .output()
+            .map_err(|e| format!("{}: {e}", blender.display()))?;
+        if !run.status.success() {
+            return Err(format!(
+                "{} exited with {}: {}",
+                blender.display(),
+                run.status,
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+    }
+
+    /// A scratch directory per test: the conversion tests run on the test threads at
+    /// the same time and must not reach for the same fixtures.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bouncing-room-converttest-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a temp directory for test fixtures");
+        dir
+    }
+
+    #[test]
+    fn each_convertible_extension_names_the_recipe_it_uses() {
+        // `CONVERTIBLE_EXTENSIONS` and `recipes_for` are two lists with nothing forcing
+        // them to agree, and the failure modes of that gap are quiet: an extension in the
+        // first but not the second converts nothing, and two recipes whose operator names
+        // were written the wrong way round still pass the operator-exists check, because
+        // both operators exist. So the pair is pinned here, name by name.
+        for ext in CONVERTIBLE_EXTENSIONS {
+            assert!(
+                !recipes_for(ext).is_empty(),
+                ".{ext} is offered to the user but has no recipe — add it to `recipes_for` \
+                 or stop offering it"
+            );
+        }
+        assert_eq!(recipes_for("blend"), [Recipe::BlenderOpen]);
+        assert_eq!(
+            recipes_for("fbx"),
+            [Recipe::BlenderImport("wm.fbx_import"), Recipe::Assimp]
+        );
+        for ext in ["usd", "usda", "usdc", "usdz"] {
+            assert_eq!(
+                recipes_for(ext),
+                [Recipe::BlenderImport("wm.usd_import")],
+                ".{ext}"
+            );
+        }
+        // And an extension neither list mentions gets nothing, rather than the USD recipe
+        // a catch-all arm would have handed it.
+        assert!(recipes_for("dae").is_empty());
+    }
+
+    #[test]
+    fn the_recipes_name_operators_this_blender_actually_has() {
+        // Every recipe here is a claim about a program that is not in this
+        // repository, and Blender moves its importers between operator categories
+        // between versions. The first draft guessed the symmetric name —
+        // `wm.fbx_export`, which Blender 5.0 does not have; its FBX writer is
+        // `export_scene.fbx` — and the test that used it skipped quietly. One
+        // start-up to ask the tool is cheaper than that, and keeps the claim true
+        // rather than true-on-the-day-it-was-written.
+        let Some(blender) = blender_program() else {
+            eprintln!("no Blender on this machine: the converter recipes go unchecked");
+            return;
+        };
+        let dir = scratch("ops");
+        // Read the operator names out of the recipes themselves. A hand-written list
+        // of what the code calls can drift from the code, and that gap is exactly
+        // where the original guess hid: the list would have gone on naming an
+        // operator that no longer existed while the recipe named another.
+        let mut ops: Vec<String> = Vec::new();
+        for ext in CONVERTIBLE_EXTENSIONS {
+            for recipe in recipes_for(ext) {
+                if let Recipe::BlenderImport(op) = recipe {
+                    if !ops.iter().any(|seen| seen == op) {
+                        ops.push((*op).to_owned());
+                    }
+                }
+            }
+        }
+        // The exporter every recipe ends with, taken from `GLB_EXPORT` rather than
+        // spelled out again next to it.
+        let export = GLB_EXPORT
+            .split("bpy.ops.")
+            .nth(1)
+            .and_then(|rest| rest.split('(').next())
+            .expect("`GLB_EXPORT` starts with an operator call, `bpy.ops.…(`");
+        ops.push(export.to_owned());
+        assert!(
+            ops.len() >= 3,
+            "this test asked Blender about {} operators, which is too few to be the \
+             recipes: {ops:?}",
+            ops.len()
+        );
+        // How the question gets asked, since three obvious ways all lie. Blender's
+        // operator proxy fabricates a stub for *any* name: measured on Blender 5.0,
+        // `hasattr(bpy.ops.wm, "definitely_not_an_operator")` is True, and calling
+        // `.idname()` on it returns `WM_OT_definitely_not_an_operator` as happily as
+        // it returns the real thing. Only the category's own listing answers honestly,
+        // so membership of `dir(bpy.ops.<category>)` is the test — and it is the only
+        // one of the three that reported `wm.fbx_export`, which this Blender does not
+        // have, as absent.
+        //
+        // And because even that could stop being honest without anyone noticing, the
+        // probe carries a name invented for the purpose and the test below insists
+        // Blender calls it missing: a check that cannot fail is worth as much as the
+        // silent skip this file used to have.
+        let canary = "wm.definitely_not_an_operator";
+        let probe_line = |op: &str| -> String {
+            let (group, name) = op.split_once('.').expect("an operator category");
+            format!(
+                "print('HAVE' if {name:?} in dir(getattr(bpy.ops, {group:?}, None)) \
+                 else 'MISSING', {op:?})\n"
+            )
+        };
+        let mut script = String::from("import bpy\nprint('BLENDER', bpy.app.version_string)\n");
+        for op in &ops {
+            script.push_str(&probe_line(op));
+        }
+        // Asked in the same run, kept out of `ops` below: it is meant to come back
+        // missing, and the assertion must not read it as a recipe that moved.
+        script.push_str(&probe_line(canary));
+        let printed = match blender_run(&dir, &script) {
+            Ok(printed) => printed,
+            Err(e) => {
+                // Found but would not run: that is this machine's setup talking, not
+                // a recipe naming a stale operator, so report and let it go.
+                eprintln!("cannot run {} for the operator check: {e}", blender.display());
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("{printed}");
+        // `HAVE`/`MISSING` for one name, read out of Blender's own reply.
+        let reported_missing = |op: &str| {
+            printed
+                .lines()
+                .any(|line| line.contains(op) && line.trim_start().starts_with("MISSING"))
+        };
+        assert!(
+            reported_missing(canary),
+            "the probe has stopped working: Blender called the invented operator \
+             {canary:?} present, so it would call anything present. Whatever `bpy.ops` \
+             lists now, this test has to find a way to ask again rather than be deleted \
+             for being inconvenient.\n{printed}"
+        );
+        for op in &ops {
+            assert!(
+                printed.contains(op.as_str()),
+                "Blender answered nothing about {op}:\n{printed}"
+            );
+        }
+        let missing = ops
+            .iter()
+            .filter(|op| reported_missing(op))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "{} does not have {missing:?}, which the recipes in this file call by name. \
+             Either Blender has moved them again — and then `recipes_for`, `GLB_EXPORT` and the \
+             module note's table all move with it — or a recipe is naming a guess. Run the operator \
+             list on the machine that fails before changing either.",
+            blender.display()
+        );
+    }
+
+    #[test]
+    fn every_convertible_extension_round_trips_a_real_file_when_blender_is_here() {
+        // The module note's table, checked rather than asserted: five extensions with
+        // no reader in this process, each written by Blender and read back through its
+        // own recipe, arriving as geometry that obeys the same four rules an OBJ does.
+        // One Blender start-up writes all five fixtures, because the tool costs about
+        // a second per launch and a test per extension would spend more time starting
+        // Blender than testing anything.
+        if blender_program().is_none() {
+            eprintln!("no Blender on this machine: no conversion round trip was run");
+            return;
+        }
+        let dir = scratch("round");
+        let printed = match blender_run(&dir, FIXTURE_WRITERS) {
+            Ok(printed) => printed,
+            Err(e) => {
+                eprintln!("could not write the conversion fixtures: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        eprintln!("{printed}");
+        let wanted = [
+            "cube.fbx", "cube.usd", "cube.usda", "cube.usdz", "cube.blend",
+        ];
+        let made: Vec<String> = printed
+            .lines()
+            .filter_map(|line| line.strip_prefix("WROTE ").map(|name| name.trim().to_owned()))
+            .collect();
+        let not_written: Vec<&&str> = wanted
+            .iter()
+            .filter(|name| !made.iter().any(|made_name| made_name == *name))
+            .collect();
+        assert!(
+            not_written.is_empty(),
+            "Blender would not write {not_written:?}, which this test needs to read back: \
+             {printed}\nIf a writer operator moved, `FIXTURE_WRITERS` moves and so does the \
+             module note's claim about what was measured."
+        );
+        for name in wanted {
+            let path = dir.join(name);
+            let import = import_path(&path)
+                .unwrap_or_else(|e| panic!("{} should import through its recipe: {e}", path.display()));
+            // The note is part of the result, not a courtesy: a round trip through a
+            // converter is a re-export, and the user has to be told.
+            let ext = path.extension().unwrap().to_str().unwrap();
+            assert!(
+                import
+                    .notes
+                    .iter()
+                    .any(|n| n.contains(&format!("converted .{ext} to glTF with Blender"))),
+                "{name}: a converted file has to say which format and which tool: {:?}",
+                import.notes
+            );
+            assert!(import.mesh.triangle_count() >= 2, "{name}: a cube has faces");
+            assert_eq!(import.source, "cube", "{name}: the HUD lists the stem");
+            assert_import_is_sane(&import);
+            assert!(import.hull.is_some(), "{name}: a cube should arrive with a hull");
+        }
+        // `.usdc` is the sixth convertible extension and is not written here: it is
+        // the binary form of the `.usd` already read above, so proving that one line
+        // of `recipes_for` twice would cost another Blender start-up for nothing.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assimp_falls_back_for_a_real_fbx_when_asked_to() {
+        // The fallback row of `recipes_for` cannot be reached on a machine that has
+        // Blender, which is every machine that runs this suite — so the recipe list is
+        // forced here. What assimp writes then goes through the same glTF reader and
+        // owes the same four rules, which is the only way that row stays true.
+        if assimp_program().is_none() {
+            eprintln!("no assimp on this machine: the FBX fallback goes unchecked");
+            return;
+        }
+        if blender_program().is_none() {
+            // Nothing to feed it with: this process cannot write an FBX, which is the
+            // whole reason the format needs a converter.
+            eprintln!("no Blender to write an FBX with: the assimp fallback goes unchecked");
+            return;
+        }
+        let dir = scratch("assimp");
+        if let Err(e) = blender_run(&dir, FIXTURE_WRITERS) {
+            eprintln!("could not write the FBX to hand to assimp: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let fbx = dir.join("cube.fbx");
+        let (bytes, tool) = convert_with(&fbx, "fbx", &[Recipe::Assimp])
+            .unwrap_or_else(|e| panic!("assimp is installed, so it should read {fbx:?}: {e}"));
+        assert_eq!(
+            tool, "assimp",
+            "the import has to name the tool that actually ran"
+        );
+        let import =
+            parse_gltf(&bytes, None, "cube").expect("the GLB assimp wrote should read here");
+        assert!(import.mesh.triangle_count() >= 2, "a cube has faces");
+        assert_import_is_sane(&import);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
