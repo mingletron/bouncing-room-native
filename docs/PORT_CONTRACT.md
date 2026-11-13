@@ -617,6 +617,25 @@ entry count is `2 mod 4` and wgpu rejects the copy outright. Every generated
 primitive happens to have an even triangle count, which is how this stayed latent
 until an import sampled down to an odd one.
 
+## Building, and what the profile can and cannot do
+
+`--release` is the whole optimization, and it is not folklore here: at 3000 bodies the
+simulation costs 1.7 ms per 1/60 s step in release against 17.3 ms in debug — about
+ten times, and debug is the profile in which a crowd cannot hold 60 fps. The release
+workflow builds and tests `--release` for linux-x86_64, macos-arm64 and macos-x86_64.
+
+Two profile changes were tried against that workload and did nothing, so do not spend an
+afternoon on them again: **thin LTO with `codegen-units = 1`** (2.35 s → 2.39 s — the
+sim's hot loop lives inside one crate and is already monomorphised and inlined at
+opt-level 3, and the renderer is Metal rather than our own code) and
+**`-C target-cpu=native`** (no measurable gain, and it makes the binary unportable across
+the three targets that get shipped). **`strip = true`** is kept in `Cargo.toml` because it
+does something measurable — 13.5 → 10.6 MB for the app, 11.6 → 9.2 MB for the probe — at
+the cost of symbolised backtraces: panic *messages* survive (they are literals), but
+`RUST_BACKTRACE=1` yields addresses. `panic` stays at the default `unwind`: a panicking
+conversion worker has to arrive as a dead channel and one panel line rather than a gone
+window.
+
 ## Sound — `src/audio.rs`
 
 The mixer sits downstream of the step and behind a mutex, reading the same records the
@@ -765,9 +784,11 @@ Things a future change could break silently, because nothing checks them:
 - Picking with the mouse, the rewind slider, the file dialog and drag-and-drop are
   covered by tests of their parts, not driven end to end; the release workflow builds
   for Linux and macOS but has never been run.
-- **Sound is unverified where it matters.** No CI machine has an audio device, so the 17
-  sound tests drive `Mixer::render` against hand-made buffers and never a stream; what no
-  test can decide is whether the design *sounds* right. And the Linux build's ALSA
+- **Sound is unverified where it matters.** No CI machine has an audio device, so the 18
+  sound tests that run by default drive `Mixer::render` against hand-made buffers and
+  never a stream; the one that opens a real device, renders through the live callback and
+  pauses it is `#[ignore]`d (`cargo test -- --ignored`) and passes on macOS. What no test
+  can decide is whether the design *sounds* right. And the Linux build's ALSA
   dependency (`libasound2-dev`, `pkg-config`) is satisfied only by the workflow step,
   which has never run — a plain `cargo build` on a bare Linux box is untested here.
 - **Recorded clips are silent.** A GIF has no audio track, so a captured demo carries

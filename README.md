@@ -45,6 +45,7 @@ It goes past what the WebGL build did in a few directions:
 cargo run --release              # the window
 cargo test                       # 137 tests: units, fixtures, simulation invariants
 cargo test -- --ignored          # + the one check that needs a real audio device
+cargo build --release            # ship it: the sim is ~10x faster than a debug build
 cargo run --bin probe -- --out probe.png    # headless render, then checks its own pixels
 cargo run -- --help              # CLI flags, including --import, --record and --mute
 ```

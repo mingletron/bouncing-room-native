@@ -55,3 +55,20 @@ rfd = "0.18"
 # does and needs no codec.
 gif = "0.14"
 cpal = "0.15"
+# Release tuning, added on measurement rather than habit. The gain is `--release`
+# itself: at 3000 bodies the simulation runs about ten times faster than debug (1.7 ms
+# per 1/60 s step, against 17.3 ms). What did *not* help, measured on that workload
+# here: thin LTO with `codegen-units = 1` (2.35 s -> 2.39 s — the hot loop lives inside
+# one crate and is already monomorphised and inlined at opt-level 3, and the renderer is
+# Metal rather than our own code), and `-C target-cpu=native` (no gain here, and it makes
+# the binary unportable across the three targets the release workflow builds).
+#
+# `strip` is the one change that does something: measured here, 13.5 -> 10.6 MB for the
+# app and 11.6 -> 9.2 MB for the probe. (Thin LTO on top trims another ~1 MB, for a
+# rebuild of every dependency each time the profile moves, and no measurable speed.) It costs
+# symbolised backtraces — panic *messages* are string literals and survive, so it is
+# `RUST_BACKTRACE=1` that turns into addresses rather than names. `panic` is left at the
+# default `unwind` on purpose: a panicking conversion worker shows up as a dead channel
+# and one panel line, and aborting would take the window with it.
+[profile.release]
+strip = true
